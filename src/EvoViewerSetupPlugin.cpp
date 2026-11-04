@@ -1,7 +1,6 @@
 #include "EvoViewerSetupPlugin.h"
 
-#include <AbstractPluginManager.h>
-#include <Application.h>
+#include <CoreInterface.h>
 #include <Plugin.h>
 #include <actions/OptionAction.h>
 #include <actions/OptionsAction.h>

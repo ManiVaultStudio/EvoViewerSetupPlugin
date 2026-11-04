@@ -24,7 +24,7 @@ class EvoViewerSetupPluginFactory final : public mv::plugin::ViewPluginFactory
 {
     Q_OBJECT
     Q_INTERFACES(mv::plugin::ViewPluginFactory mv::plugin::PluginFactory)
-    Q_PLUGIN_METADATA(IID "studio.manivault.EvoViewerSetupPlugin")
+    Q_PLUGIN_METADATA(IID "studio.manivault.EvoViewerSetupPlugin" FILE "../PluginInfo.json")
 
 public:
     EvoViewerSetupPluginFactory();

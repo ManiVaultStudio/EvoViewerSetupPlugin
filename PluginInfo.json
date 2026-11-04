@@ -2,8 +2,19 @@
   "name": "EvoViewer Setup Plugin",
   "version": {
     "plugin": "1.0.0",
-    "core": ["1.3"]
+    "core": ["1.5"]
   },
   "type": "View",
-  "dependencies": []
+  "dependencies": [
+    "Scatterplot View",
+    "Cross-Species Comparison Cluster Rank View",
+    "ChartLegend View",
+    "XSCGeneDetect",
+    "XSCPhyTVu",
+    "Tutorial",
+    "Points",
+    "Cluster",
+    "XSCTree",
+    "XSCTreeMeta"
+  ]
 }
