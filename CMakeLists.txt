@@ -3,19 +3,24 @@ cmake_minimum_required(VERSION 3.22)
 project(EvoViewerSetupPlugin LANGUAGES CXX)
 
 find_package(Qt6 COMPONENTS Widgets Network WebEngineWidgets REQUIRED)
-find_package(ManiVault COMPONENTS Core CONFIG QUIET)
+find_package(ManiVault COMPONENTS Core PointData ClusterData CONFIG QUIET)
 mv_project_defaults()
 
 set(PLUGIN_SOURCES
     src/EvoViewerSetupPlugin.h
     src/EvoViewerSetupPlugin.cpp
+    src/EvoViewerSetupRequirements.h
+    src/EvoViewerSetupRequirements.cpp
+    src/EvoViewerSetupData.h
+    src/EvoViewerSetupData.cpp
+    src/EvoViewerSetupWorkflow.cpp
     PluginInfo.json
 )
 
 add_library(${PROJECT_NAME} SHARED ${PLUGIN_SOURCES})
 target_include_directories(${PROJECT_NAME} PRIVATE "${ManiVault_INCLUDE_DIR}")
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
-target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets Qt6::Network Qt6::WebEngineWidgets ManiVault::Core)
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets Qt6::Network Qt6::WebEngineWidgets ManiVault::Core ManiVault::PointData ManiVault::ClusterData)
 set_target_properties(${PROJECT_NAME} PROPERTIES AUTOMOC ON)
 
 install(TARGETS ${PROJECT_NAME}

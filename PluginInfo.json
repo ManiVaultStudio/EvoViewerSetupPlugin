@@ -7,7 +7,7 @@
   "type": "View",
   "dependencies": [
     "Scatterplot View",
-    "Cross-Species Comparison Cluster Rank View",
+    "XSC Cluster Rank",
     "ChartLegend View",
     "XSCGeneDetect",
     "XSCPhyTVu",

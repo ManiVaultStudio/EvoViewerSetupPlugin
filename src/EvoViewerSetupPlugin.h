@@ -2,9 +2,6 @@
 
 #include <ViewPlugin.h>
 
-class QLabel;
-class QPushButton;
-
 class EvoViewerSetupPlugin final : public mv::plugin::ViewPlugin
 {
     Q_OBJECT
@@ -16,8 +13,7 @@ public:
 private:
     void setupWorkspace();
 
-    QLabel* _statusLabel = nullptr;
-    QPushButton* _setupButton = nullptr;
+    bool _setupStarted = false;
 };
 
 class EvoViewerSetupPluginFactory final : public mv::plugin::ViewPluginFactory
@@ -31,4 +27,11 @@ public:
     mv::plugin::ViewPlugin* produce() override;
     mv::DataTypes supportedDataTypes() const override;
     mv::gui::PluginTriggerActions getPluginTriggerActions(const mv::Datasets& datasets) const override;
+
+private:
+    void updateAvailability();
+    void scheduleAvailabilityUpdate();
+
+    bool _availabilityUpdateScheduled = false;
+    bool _setupAvailable = false;
 };
