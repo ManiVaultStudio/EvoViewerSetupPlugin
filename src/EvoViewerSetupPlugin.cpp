@@ -7,12 +7,13 @@
 #include <actions/StringAction.h>
 
 #include <QLabel>
+#include <QList>
 #include <QPushButton>
+#include <QSplitter>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QStringList>
 #include <util/DockArea.h>
-
-#include <array>
 
 using namespace mv;
 using namespace mv::plugin;
@@ -27,6 +28,83 @@ struct ViewRequest
     ViewPlugin* dockTarget;
     DockAreaFlag dockArea;
 };
+
+bool containsView(QWidget* branch, ViewPlugin* view)
+{
+    return branch && view && (branch == &view->getWidget() || branch->isAncestorOf(&view->getWidget()));
+}
+
+void applyEvoViewerSplitSizes(QWidget* workspace, ViewPlugin* cluster, ViewPlugin* scatter,
+                              ViewPlugin* genes, ViewPlugin* tree)
+{
+    if (!workspace || !cluster || !scatter || !genes || !tree)
+        return;
+
+    for (auto* splitter : workspace->findChildren<QSplitter*>()) {
+        const auto count = splitter->count();
+        if (count < 2)
+            continue;
+
+        QList<bool> hasCluster(count), hasScatter(count), hasGenes(count), hasTree(count);
+        for (int i = 0; i < count; ++i) {
+            auto* branch = splitter->widget(i);
+            hasCluster[i] = containsView(branch, cluster);
+            hasScatter[i] = containsView(branch, scatter);
+            hasGenes[i] = containsView(branch, genes);
+            hasTree[i] = containsView(branch, tree);
+        }
+
+        QList<int> weights(count, 1);
+        bool apply = false;
+
+        if (splitter->orientation() == Qt::Vertical) {
+            int clusterIndex = -1;
+            int lowerIndex = -1;
+            for (int i = 0; i < count; ++i) {
+                if (hasCluster[i])
+                    clusterIndex = i;
+                if (hasScatter[i] || hasGenes[i] || hasTree[i])
+                    lowerIndex = i;
+            }
+            if (clusterIndex >= 0 && lowerIndex >= 0 && clusterIndex != lowerIndex) {
+                weights[clusterIndex] = 11;
+                weights[lowerIndex] = 89;
+                apply = true;
+            }
+        } else {
+            int scatterIndex = -1;
+            int genesIndex = -1;
+            int treeIndex = -1;
+            for (int i = 0; i < count; ++i) {
+                if (hasScatter[i]) scatterIndex = i;
+                if (hasGenes[i]) genesIndex = i;
+                if (hasTree[i]) treeIndex = i;
+            }
+
+            if (scatterIndex >= 0 && genesIndex >= 0 && treeIndex >= 0 &&
+                scatterIndex != genesIndex && scatterIndex != treeIndex && genesIndex != treeIndex) {
+                weights[scatterIndex] = 3;
+                weights[genesIndex] = 4;
+                weights[treeIndex] = 3;
+                apply = true;
+            } else if (scatterIndex >= 0 && (genesIndex >= 0 || treeIndex >= 0)) {
+                const auto otherIndex = genesIndex >= 0 ? genesIndex : treeIndex;
+                if (scatterIndex != otherIndex) {
+                    weights[scatterIndex] = 3;
+                    weights[otherIndex] = 7;
+                    apply = true;
+                }
+            } else if (genesIndex >= 0 && treeIndex >= 0 && genesIndex != treeIndex) {
+                weights[genesIndex] = 4;
+                weights[treeIndex] = 3;
+                apply = true;
+            }
+        }
+
+        if (apply)
+            splitter->setSizes(weights);
+    }
+}
 }
 
 EvoViewerSetupPlugin::EvoViewerSetupPlugin(const PluginFactory* factory) :
@@ -95,21 +173,14 @@ void EvoViewerSetupPlugin::setupWorkspace()
         return view;
     };
 
-    const ViewRequest scatterRequest{
-        "Scatterplot View", "Scatterplot Embedding View", nullptr, DockAreaFlag::Right
-    };
-    auto* scatterplot = ensureView(scatterRequest);
-
-    const std::array<ViewRequest, 5> requests{{
-        { "Cross-Species Comparison Cluster Rank View", "Cluster Hierarchy View", scatterplot, DockAreaFlag::Left },
-        { "ChartLegend View", "Legend View", scatterplot, DockAreaFlag::Bottom },
-        { "XSCPhyTVu", "Phylogenetic Tree View", scatterplot, DockAreaFlag::Right },
-        { "XSCGeneDetect", "Gene Identification View", scatterplot, DockAreaFlag::Center },
-        { "Tutorial", "", scatterplot, DockAreaFlag::Bottom }
-    }};
-
-    for (const auto& request : requests)
-        ensureView(request);
+    // Add the legend as a tab behind the hierarchy, then split the remaining
+    // area into the same top-and-three-column layout shown in the reference.
+    auto* legend = ensureView({ "ChartLegend View", "Legend View", nullptr, DockAreaFlag::Right });
+    auto* cluster = ensureView({ "Cross-Species Comparison Cluster Rank View", "Cluster Hierarchy View", legend, DockAreaFlag::Center });
+    auto* scatterplot = ensureView({ "Scatterplot View", "Scatterplot Embedding View", cluster, DockAreaFlag::Bottom });
+    auto* genes = ensureView({ "XSCGeneDetect", "Gene Identification View", scatterplot, DockAreaFlag::Right });
+    auto* tree = ensureView({ "XSCPhyTVu", "Phylogenetic Tree View", genes, DockAreaFlag::Right });
+    ensureView({ "Tutorial", "", scatterplot, DockAreaFlag::Bottom });
 
     // Reapply the current trait and species selections in case an older saved
     // project restored the views before their EvoViewer GUI names were applied.
@@ -155,6 +226,13 @@ void EvoViewerSetupPlugin::setupWorkspace()
     else
         _statusLabel->setText(linksReady ? QStringLiteral("EvoViewer ready: 6 views")
                                         : QStringLiteral("Views ready; links pending"));
+
+    if (failures.isEmpty()) {
+        QTimer::singleShot(150, this, [this, cluster, scatterplot, genes, tree]() {
+            applyEvoViewerSplitSizes(mv::workspaces().getWidget(), cluster, scatterplot, genes, tree);
+            getVisibleAction().setChecked(false);
+        });
+    }
 }
 EvoViewerSetupPluginFactory::EvoViewerSetupPluginFactory()
 {
