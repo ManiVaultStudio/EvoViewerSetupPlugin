@@ -1,0 +1,13 @@
+{
+    "ActionType": "mv::gui::StorageBackendConversionAction",
+    "ConnectionPermissions": 0,
+    "Expanded": false,
+    "ID": "1e74a5c3-74b1-4fe9-8fff-136d770e5c85",
+    "IsChecked": false,
+    "IsForceDisabled": false,
+    "IsForceHidden": false,
+    "IsPublic": false,
+    "PublicActionID": "",
+    "SortIndex": -1,
+    "Stretch": -1
+}
