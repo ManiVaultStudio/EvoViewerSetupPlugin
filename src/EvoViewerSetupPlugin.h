@@ -12,6 +12,7 @@ public:
 
 private:
     void setupWorkspace();
+    void initializeExperiments();
 
     bool _setupStarted = false;
 };

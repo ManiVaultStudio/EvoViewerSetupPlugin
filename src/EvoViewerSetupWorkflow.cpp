@@ -238,90 +238,49 @@ bool connectToPublishedAction(WidgetAction* privateAction, WidgetAction* sourceA
 }
 
 void applyEvoViewerSplitSizes(QWidget* workspace, ViewPlugin* cluster, ViewPlugin* scatter,
-                              ViewPlugin* legend, ViewPlugin* genes, ViewPlugin* tree)
+                              ViewPlugin* legend, ViewPlugin* genes, ViewPlugin* tree,
+                              ViewPlugin* tutorial)
 {
-    if (!workspace || !cluster || !scatter || !legend || !genes || !tree)
+    if (!workspace)
         return;
 
-    const auto branchContains = [](QWidget* branch, ViewPlugin* view) {
-        return branch && view && (branch == &view->getWidget() || branch->isAncestorOf(&view->getWidget()));
-    };
-
     for (auto* splitter : workspace->findChildren<QSplitter*>()) {
-        const int count = splitter->count();
-        if (count < 2)
+        const bool vertical = splitter->orientation() == Qt::Vertical;
+        const auto views = { std::pair{cluster, vertical ? 16 : 100}, std::pair{scatter, vertical ? 84 : 25},
+                             std::pair{legend, vertical ? 84 : 10}, std::pair{genes, vertical ? 84 : 40},
+                             std::pair{tree, vertical ? 84 : 25}, std::pair{tutorial, vertical ? 84 : 24} };
+        auto sizes = splitter->sizes();
+        QList<int> weights(sizes.size(), 0);
+        int available = 0;
+        int totalWeight = 0;
+        int branches = 0;
+        for (int i = 0; i < sizes.size(); ++i) {
+            auto* branch = splitter->widget(i);
+            for (const auto& [view, weight] : views) {
+                if (!view || !view->getVisibleAction().isChecked() ||
+                    (branch != &view->getWidget() && !branch->isAncestorOf(&view->getWidget())))
+                    continue;
+                if (vertical)
+                    weights[i] = std::max(weights[i], weight);
+                else
+                    weights[i] += weight;
+            }
+            if (weights[i] > 0) {
+                ++branches;
+                available += sizes[i];
+                totalWeight += weights[i];
+            }
+        }
+        if (branches < 2 || available <= 0)
             continue;
 
-        QList<bool> hasCluster(count), hasScatter(count), hasLegend(count), hasGenes(count), hasTree(count);
-        for (int i = 0; i < count; ++i) {
-            auto* branch = splitter->widget(i);
-            hasCluster[i] = branchContains(branch, cluster);
-            hasScatter[i] = branchContains(branch, scatter);
-            hasLegend[i] = branchContains(branch, legend);
-            hasGenes[i] = branchContains(branch, genes);
-            hasTree[i] = branchContains(branch, tree);
-        }
+        for (int i = 0; i < sizes.size(); ++i)
+            if (weights[i] > 0)
+                sizes[i] = std::max(1, static_cast<int>(qint64(available) * weights[i] / totalWeight));
 
-        QList<int> weights(count, 1);
-        bool shouldResize = false;
-        if (splitter->orientation() == Qt::Vertical) {
-            int upper = -1;
-            int lower = -1;
-            for (int i = 0; i < count; ++i) {
-                if (hasCluster[i]) upper = i;
-                if (hasScatter[i] || hasLegend[i] || hasGenes[i] || hasTree[i]) lower = i;
-            }
-            if (upper >= 0 && lower >= 0 && upper != lower) {
-                weights[upper] = 16;
-                weights[lower] = 84;
-                shouldResize = true;
-            }
-        } else {
-            int scatterIndex = -1;
-            int legendIndex = -1;
-            int genesIndex = -1;
-            int treeIndex = -1;
-            for (int i = 0; i < count; ++i) {
-                if (hasScatter[i]) scatterIndex = i;
-                if (hasLegend[i]) legendIndex = i;
-                if (hasGenes[i]) genesIndex = i;
-                if (hasTree[i]) treeIndex = i;
-            }
-
-            if (scatterIndex >= 0 && legendIndex >= 0 && genesIndex >= 0 && treeIndex >= 0 &&
-                scatterIndex != legendIndex && scatterIndex != genesIndex && scatterIndex != treeIndex &&
-                legendIndex != genesIndex && legendIndex != treeIndex && genesIndex != treeIndex) {
-                weights[scatterIndex] = 25;
-                weights[legendIndex] = 10;
-                weights[genesIndex] = 40;
-                weights[treeIndex] = 25;
-                shouldResize = true;
-            } else if (scatterIndex >= 0 && (legendIndex >= 0 || genesIndex >= 0 || treeIndex >= 0)) {
-                const int other = legendIndex >= 0 ? legendIndex : (genesIndex >= 0 ? genesIndex : treeIndex);
-                if (other != scatterIndex) {
-                    weights[scatterIndex] = 25;
-                    weights[other] = 70;
-                    shouldResize = true;
-                }
-            } else if (legendIndex >= 0 && (genesIndex >= 0 || treeIndex >= 0)) {
-                const int other = genesIndex >= 0 ? genesIndex : treeIndex;
-                if (other != legendIndex) {
-                    weights[legendIndex] = 10;
-                    weights[other] = 58;
-                    shouldResize = true;
-                }
-            } else if (genesIndex >= 0 && treeIndex >= 0 && genesIndex != treeIndex) {
-                weights[genesIndex] = 34;
-                weights[treeIndex] = 24;
-                shouldResize = true;
-            }
-        }
-
-        if (shouldResize)
-            splitter->setSizes(weights);
+        splitter->setSizes(sizes);
     }
 }
-
 void hideSystemView(const QString& kind)
 {
     auto* factory = mv::plugins().getPluginFactory(kind);
@@ -743,20 +702,15 @@ void EvoViewerSetupPlugin::setupWorkspace()
     hideSystemView(QStringLiteral("Data properties"));
     hideSystemView(QStringLiteral("Data hierarchy"));
 
-    // Close this empty setup view without destroying it, apply the final sizes,
-    // and open the requested tutorial only after all setup work has completed.
-    getVisibleAction().setChecked(false);
-    QTimer::singleShot(250, this, [cluster, scatter, legend, genes, tree, scatterColor,
+    // Open the tutorial after the linked views are ready.
+    QTimer::singleShot(250, this, [this, cluster, scatter, legend, genes, tree, scatterColor,
                                    legendClusters, disableStudioMode]() {
         QStringList ignoredFailures;
         auto* tutorial = findOrCreateView({ "Tutorial", "", nullptr, DockAreaFlag::Right }, ignoredFailures);
 
         hideSystemView(QStringLiteral("Data properties"));
         hideSystemView(QStringLiteral("Data hierarchy"));
-        // Creating the tutorial can change the docking tree; size the final
-        // view arrangement after it has joined the workspace.
-        applyEvoViewerSplitSizes(mv::workspaces().getWidget(), cluster, scatter, legend, genes, tree);
-        selectEvoViewerTutorial(tutorial, [tutorial, scatter, scatterColor, legendClusters,
+        selectEvoViewerTutorial(tutorial, [setup = QPointer<EvoViewerSetupPlugin>(this), tutorial, scatter, scatterColor, legendClusters,
                                            cluster, legend, genes, tree,
                                            disableStudioMode](bool tutorialSelected) {
             if (!tutorialSelected)
@@ -786,14 +740,28 @@ void EvoViewerSetupPlugin::setupWorkspace()
                 qWarning() << "EvoViewer setup: selection-color connection failed after layout.";
             hideSystemView(QStringLiteral("Data properties"));
             hideSystemView(QStringLiteral("Data hierarchy"));
-            QCoreApplication::processEvents();
-            applyEvoViewerSplitSizes(mv::workspaces().getWidget(), cluster, scatter, legend, genes, tree);
+            if (setup)
+                setup->getVisibleAction().setChecked(false);
             disableStudioMode();
             if (auto* workspace = mv::workspaces().getCurrentWorkspace()) {
                 workspace->getLockingAction().getLockedAction().setChecked(true);
                 if (!workspace->getLockingAction().getLockedAction().isChecked())
                     qWarning() << "EvoViewer setup: workspace layout could not be locked.";
             }
+            if (tutorial) {
+                auto allowTutorialClose = [tutorial]() { tutorial->getMayCloseAction().setChecked(true); };
+                connect(&tutorial->getLockingAction().getLockedAction(), &ToggleAction::toggled,
+                        tutorial, allowTutorialClose);
+                allowTutorialClose();
+            }
+            if (!setup)
+                return;
+            QTimer::singleShot(0, setup, [cluster = QPointer<ViewPlugin>(cluster),
+                scatter = QPointer<ViewPlugin>(scatter), legend = QPointer<ViewPlugin>(legend),
+                genes = QPointer<ViewPlugin>(genes), tree = QPointer<ViewPlugin>(tree),
+                tutorial = QPointer<ViewPlugin>(tutorial)]() {
+                applyEvoViewerSplitSizes(mv::workspaces().getWidget(), cluster, scatter, legend, genes, tree, tutorial);
+            });
         });
     });
 }

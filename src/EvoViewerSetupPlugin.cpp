@@ -17,13 +17,14 @@ EvoViewerSetupPlugin::EvoViewerSetupPlugin(const mv::plugin::PluginFactory* fact
 
 void EvoViewerSetupPlugin::init()
 {
+    initializeExperiments();
     _setupStarted = false;
     QTimer::singleShot(0, this, &EvoViewerSetupPlugin::setupWorkspace);
 }
 
 EvoViewerSetupPluginFactory::EvoViewerSetupPluginFactory()
 {
-    setIconByName("diagram-project");
+    setIconByName("compass");
     getPluginMetadata().setDescription("Set up EvoViewer views and their linked controls.");
     getPluginMetadata().setSummary("Opens the EvoViewer views and configures their shared datasets.");
     setAllowPluginCreationFromStandardGui(false);

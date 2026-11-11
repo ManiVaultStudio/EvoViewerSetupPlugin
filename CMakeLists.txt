@@ -14,6 +14,7 @@ set(PLUGIN_SOURCES
     src/EvoViewerSetupData.h
     src/EvoViewerSetupData.cpp
     src/EvoViewerSetupWorkflow.cpp
+    src/TiledStorageExperiment.cpp
     PluginInfo.json
 )
 
