@@ -30,6 +30,8 @@
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QProgressBar>
+#include <QProgressDialog>
+#include <QScopedValueRollback>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTimer>
@@ -414,6 +416,7 @@ private:
 
         _installed = std::move(original);
         _converted = false;
+        _cacheAdjusted = false;
         _rows = _installed->rows();
         _columns = _installed->columns();
         _elementSize = _installed->elementSize();
@@ -425,17 +428,12 @@ private:
         _cacheBytes = initial.cacheCapacityBytes;
         _candidate = {initial.rowTileSize, initial.columnTileSize, initial.cacheCapacity,
                       initial.superTileRows, initial.superTileColumns};
-        for (std::size_t axis = 0; axis < _candidate.size(); ++axis)
-            _candidate[axis] = std::clamp(_candidate[axis], _lower[axis], _upper[axis]);
-        if (!validCandidate(_candidate)) {
-            _candidate[0] = std::min<std::size_t>(256, _rows);
-            _candidate[1] = std::min<std::size_t>(8, _columns);
-            _candidate[3] = _candidate[4] = 1;
-        }
+        _baseline = _candidate;
         _primer.assign(_selection.begin(), _selection.begin() + std::min<std::size_t>(32, _selection.size() / 2));
         _previousSelection = _points->getSelectionIndices();
         _expected = _previousSelection;
         _previousClusterIndices = _clusters->getSelectionIndices();
+        _lastClusterSelection = _previousClusterIndices;
         _appliedClusterSelection = false;
         _best = _candidate;
         _center = _candidate;
@@ -449,6 +447,7 @@ private:
         _estimatedRestoreMs = 0;
         _pausedMs = 0;
         _pauseClock.invalidate();
+        _packedSeedTried = false;
         _visited.clear();
         _visited.insert(_candidate);
         _phase = Phase::Next;
@@ -465,6 +464,23 @@ private:
         scheduleNext();
     }
 
+    static constexpr quint64 maxPackedFiles = 100000;
+
+    quint64 packedFileCount(const Candidate& candidate) const
+    {
+        const auto height = quint64(candidate[0]) * candidate[3];
+        const auto width = quint64(candidate[1]) * candidate[4];
+        return ((_rows + height - 1) / height) * ((_columns + width - 1) / width);
+    }
+
+    bool matchesInstalledLayout(const StorageBackendConfiguration& config) const
+    {
+        return _installed->packedTiles() == config.packedTiles &&
+            _installed->rowTileSize() == config.rowTileSize &&
+            _installed->columnTileSize() == config.columnTileSize &&
+            _installed->superTileRows() == config.superTileRows &&
+            _installed->superTileColumns() == config.superTileColumns;
+    }
     bool validCandidate(const Candidate& c) const
     {
         // Limit the decoded payload of an individual super-tile.
@@ -475,6 +491,30 @@ private:
 
     bool selectCandidate()
     {
+        if (!_packedSeedTried && (packedFileCount(_center) > maxPackedFiles || !_initial.packedTiles)) {
+            _packedSeedTried = true;
+            auto seed = _center;
+            for (std::size_t axis = 0; axis < seed.size(); ++axis)
+                seed[axis] = std::clamp(seed[axis], _lower[axis], _upper[axis]);
+            while (packedFileCount(seed) > maxPackedFiles) {
+                const auto previous = seed;
+                for (const int axis : {3, 4, 0, 1}) {
+                    auto larger = seed;
+                    larger[axis] = std::min(_upper[axis], larger[axis] * 2);
+                    if (validCandidate(larger) && packedFileCount(larger) < packedFileCount(seed))
+                        seed = larger;
+                    if (packedFileCount(seed) <= maxPackedFiles)
+                        break;
+                }
+                if (seed == previous)
+                    break;
+            }
+            if (validCandidate(seed) && packedFileCount(seed) <= maxPackedFiles &&
+                _visited.insert(seed).second) {
+                _candidate = seed;
+                return true;
+            }
+        }
         while (_radius >= 0.125) {
             if (_direction == 10) {
                 // Reduce the search radius when a complete sweep fails to improve by 2%.
@@ -492,7 +532,9 @@ private:
             const auto stride = std::max<qint64>(1, std::llround(value * _radius));
             candidate[axis] = std::clamp(value + (direction % 2 ? stride : -stride),
                                          static_cast<qint64>(_lower[axis]), static_cast<qint64>(_upper[axis]));
-            if (validCandidate(candidate) && _visited.insert(candidate).second) {
+            if (validCandidate(candidate) &&
+                (matchesInstalledLayout(configuration(candidate)) || packedFileCount(candidate) <= maxPackedFiles) &&
+                _visited.insert(candidate).second) {
                 _candidate = candidate;
                 return true;
             }
@@ -502,6 +544,8 @@ private:
 
     StorageBackendConfiguration configuration(const Candidate& candidate) const
     {
+        if (candidate == _baseline)
+            return _initial;
         StorageBackendConfiguration config;
         config.rowTileSize = candidate[0];
         config.columnTileSize = candidate[1];
@@ -531,15 +575,15 @@ private:
     bool inputsMatch()
     {
         return _picker && _update && _geneStatus && _points.isValid() && _clusters.isValid() &&
-            _clusters->getSelectionIndices() == (_appliedClusterSelection ? _clusterIndices : _previousClusterIndices) &&
             _picker->getCurrentDatasetId() == _points->getId() &&
-            backend() && backend()->getStorage() == _installed &&
-            _points->getSelectionIndices() == _expected;
+            !_points->isLocked() && _clusters->getParent().isValid() &&
+            _clusters->getParent()->getId() == _points->getId() &&
+            backend() && backend()->getStorage() == _installed;
     }
 
     void advance()
     {
-        if (!_active || _poll.isActive())
+        if (!_active || _poll.isActive() || _storageBusy)
             return;
         if (_stopped) {
             finish(tr("Stopped"));
@@ -587,6 +631,7 @@ private:
 
     void convert()
     {
+        const QScopedValueRollback busy(_storageBusy, true);
         beginStage(tr("storage update · tile %1 × %2, cache %3, super-tile %4 × %5")
             .arg(_candidate[0]).arg(_candidate[1]).arg(_candidate[2]).arg(_candidate[3]).arg(_candidate[4]));
         _status->setText(tr("Trial %1 · Rebuilding tiled storage").arg(_trial));
@@ -596,27 +641,61 @@ private:
         QElapsedTimer timer;
         timer.start();
         try {
-            const StorageBackendProgressCallback progress = [this](float fraction) {
-                const auto percent = qRound(fraction * 100);
-                if (percent != _progress->value()) {
-                    _progress->setValue(percent);
-                    _progress->repaint();
-                }
+            qint64 lastRefresh = -1000;
+            const StorageBackendProgressCallback progress = [this, &timer, &lastRefresh](float fraction) {
+                const auto elapsed = timer.elapsed();
+                if (fraction < 1.0f && elapsed - lastRefresh < 1000)
+                    return;
+                lastRefresh = elapsed;
+                _progress->setValue(qRound(fraction * 100));
+                _status->setText(tr("Trial %1 · %2 · %3 s").arg(_trial)
+                    .arg(fraction >= 1.0f ? tr("Finalizing tiled storage") : tr("Rebuilding tiled storage"))
+                    .arg(elapsed / 1000));
+                _status->repaint();
+                _progress->repaint();
             };
             const auto config = configuration(_candidate);
-            if (_converted && _installed->rowTileSize() == config.rowTileSize &&
-                _installed->columnTileSize() == config.columnTileSize &&
-                _installed->superTileRows() == config.superTileRows &&
-                _installed->superTileColumns() == config.superTileColumns &&
-                _elementSize > 1) {
+            if (matchesInstalledLayout(config)) {
+                trace(tr("Trial %1 · Reusing the existing packed layout").arg(_trial));
                 // Evict the decoded tiles before timing another capacity on the same layout.
                 auto cold = std::make_shared<StorageBackendConfiguration>(config);
                 cold->cacheCapacityBytes = 1;
+                _cacheAdjusted = true;
                 _points->configureStorageBackend(cold);
                 _points->configureStorageBackend(std::make_shared<StorageBackendConfiguration>(config));
                 progress(1.0f);
             } else {
-                _points->convertToStorageBackend(StorageBackendType::Tiled, config, progress);
+                trace(tr("Trial %1 · Rebuild will write %2 temporary packed files").arg(_trial).arg(packedFileCount(_candidate)));
+                QProgressDialog dialog(tr("Preparing storage rebuild…"), tr("Cancel experiment"), 0, 10000, this);
+                dialog.setWindowModality(Qt::ApplicationModal);
+                dialog.setMinimumDuration(0);
+                dialog.setAutoClose(false);
+                dialog.setAutoReset(false);
+                dialog.show();
+                qint64 lastDialogRefresh = -250;
+                bool cancelled = false;
+                try {
+                    const StorageBackendProgressCallback rebuildProgress = [&](float fraction) {
+                        const auto elapsed = timer.elapsed();
+                        if (fraction < 1.0f && elapsed - lastDialogRefresh < 250)
+                            return;
+                        lastDialogRefresh = elapsed;
+                        progress(fraction);
+                        dialog.setLabelText(tr("Rebuilding tiled storage · %1% · %2 s")
+                            .arg(fraction * 100.0, 0, 'f', 2).arg(elapsed / 1000));
+                        dialog.setValue(qRound(fraction * 10000));
+                        if (dialog.wasCanceled()) {
+                            cancelled = true;
+                            throw std::runtime_error("Tiled storage rebuild cancelled");
+                        }
+                    };
+                    _points->convertToStorageBackend(StorageBackendType::Tiled, config, rebuildProgress);
+                } catch (...) {
+                    if (!cancelled)
+                        throw;
+                    finish(tr("Stopped during storage rebuild"));
+                    return;
+                }
                 _installed = backend()->getStorage();
                 _converted = true;
                 _estimatedRestoreMs = std::max(_estimatedRestoreMs, timer.elapsed());
@@ -642,12 +721,13 @@ private:
         }
         _clusters->setSelectionIndices(_clusterIndices);
         _appliedClusterSelection = true;
+        _lastClusterSelection = _clusters->getSelectionIndices();
         // Linked selection handlers can rewrite the points after the cluster action.
         // Set the exact rows for this update after those handlers have run.
         _expected = selection;
         if (_points->getSelectionIndices() != _expected)
             _points->setSelectionIndices(_expected);
-        if (!inputsMatch()) {
+        if (!inputsMatch() || _points->getSelectionIndices() != _expected) {
             finish(tr("Could not apply the benchmark selection to the main points dataset"));
             return;
         }
@@ -738,10 +818,13 @@ private:
             return;
         }
         if (!inputsMatch()) {
-            finish(tr("The benchmark selection, main dataset, or storage changed during Gene Identification Update"));
+            finish(tr("The main dataset or storage changed during Gene Identification Update"));
             return;
         }
-        endStage(tr("Update completed with the expected selection"));
+        // Gene Identification checks its input selection before publication.
+        // Publication can then change the linked selection, including the cluster indices.
+        observePublishedSelection();
+        endStage(tr("Update completed"));
         if (_phase == Phase::Measure) {
             _updateMs = _completionMs >= 0 ? _completionMs : _operation.elapsed();
             _trialScore = _selectedWorkloads.contains(updateName()) ? _updateMs : 0;
@@ -759,6 +842,17 @@ private:
             _phase = Phase::Convert;
         }
         scheduleNext();
+    }
+
+    void observePublishedSelection()
+    {
+        const auto& cells = _points->getSelectionIndices();
+        const auto& clusters = _clusters->getSelectionIndices();
+        if (cells != _expected || clusters != _lastClusterSelection)
+            trace(tr("Trial %1 · Result publication changed the linked selection to %2 cells and %3 clusters")
+                .arg(_trial).arg(cells.size()).arg(clusters.size()));
+        _expected = cells;
+        _lastClusterSelection = clusters;
     }
 
     void watchAnalysisTask(mv::Task* task)
@@ -793,8 +887,16 @@ private:
             return;
         }
 
+        if (_clusterIndices.back() >= static_cast<std::size_t>(_clusters->getClusters().size())) {
+            finish(tr("The cluster dataset changed during the experiment"));
+            return;
+        }
         _clusters->setSelectionIndices(_clusterIndices);
-        if (!inputsMatch()) {
+        _lastClusterSelection = _clusters->getSelectionIndices();
+        _expected = _selection;
+        if (_points->getSelectionIndices() != _expected)
+            _points->setSelectionIndices(_expected);
+        if (!inputsMatch() || _points->getSelectionIndices() != _expected) {
             finish(tr("The selected clusters no longer match the benchmark cells"));
             return;
         }
@@ -855,6 +957,7 @@ private:
             return;
         }
         const auto elapsed = _analysisMs >= 0 ? _analysisMs : _operation.elapsed();
+        observePublishedSelection();
         endStage(tr("Task completed · measured %1 ms").arg(elapsed));
         _trialScore += elapsed;
         if (name == correlationName())
@@ -901,16 +1004,20 @@ private:
         closeAnalysis();
         endStage(message);
         trace(tr("Ending experiment · %1").arg(message));
-        if (backend() && backend()->getStorage() == _installed && _converted) {
+        if (backend() && backend()->getStorage() == _installed && (_converted || _cacheAdjusted)) {
             beginStage(tr("restoring original tiled storage settings"));
             _status->setText(tr("Restoring the original tiled storage settings…"));
             _status->repaint();
             _progress->setRange(0, 100);
             try {
-                _points->convertToStorageBackend(StorageBackendType::Tiled, _initial, [this](float fraction) {
+                if (matchesInstalledLayout(_initial)) {
+                    _points->configureStorageBackend(std::make_shared<StorageBackendConfiguration>(_initial));
+                } else {
+                    _points->convertToStorageBackend(StorageBackendType::Tiled, _initial, [this](float fraction) {
                     _progress->setValue(qRound(fraction * 100));
                     _progress->repaint();
-                });
+                    });
+                }
                 endStage(tr("Original settings restored"));
             } catch (const std::exception& error) {
                 endStage(tr("Could not restore the original settings (%1)").arg(QString::fromUtf8(error.what())));
@@ -918,7 +1025,7 @@ private:
         }
         if (_points.isValid() && _points->getSelectionIndices() == _expected) {
             if (_clusters.isValid() && _appliedClusterSelection &&
-                _clusters->getSelectionIndices() == _clusterIndices &&
+                _clusters->getSelectionIndices() == _lastClusterSelection &&
                 std::all_of(_previousClusterIndices.begin(), _previousClusterIndices.end(), [this](auto index) {
                     return index < static_cast<std::size_t>(_clusters->getClusters().size());
                 }))
@@ -1027,6 +1134,7 @@ private:
     mv::Dataset<Clusters> _clusters;
     std::vector<std::uint32_t> _clusterIndices;
     std::vector<std::uint32_t> _previousClusterIndices;
+    std::vector<std::uint32_t> _lastClusterSelection;
     bool _appliedClusterSelection = false;
     std::shared_ptr<Storage> _installed;
     std::vector<std::uint32_t> _selection;
@@ -1058,7 +1166,11 @@ private:
     int _trial = 0;
     int _direction = 0;
     Phase _phase = Phase::Next;
+    Candidate _baseline{};
+    bool _packedSeedTried = false;
+    bool _storageBusy = false;
     bool _converted = false;
+    bool _cacheAdjusted = false;
     bool _active = false;
     bool _paused = false;
     bool _stopped = false;
