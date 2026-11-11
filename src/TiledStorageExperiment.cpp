@@ -17,6 +17,8 @@
 #include <actions/TriggerAction.h>
 
 #include <QElapsedTimer>
+#include <QDebug>
+#include <QTime>
 #include <QFileDialog>
 #include <QGroupBox>
 #include <QJsonDocument>
@@ -100,7 +102,7 @@ public:
         budget->addStretch();
         controls->addLayout(budget);
 
-        _output = new QPushButton(tr("Choose preset output…"), group);
+        _output = new QPushButton(tr("Choose automatic preset output…"), group);
         controls->addWidget(_output);
         connect(_output, &QPushButton::clicked, this, [this]() {
             const auto path = choosePresetPath();
@@ -224,29 +226,57 @@ private:
         return nullptr;
     }
 
+    void trace(const QString& message)
+    {
+        const auto line = QStringLiteral("[%1] %2").arg(QTime::currentTime().toString(QStringLiteral("HH:mm:ss.zzz")), message);
+        _log->appendPlainText(line);
+        qInfo().noquote() << "[EvoViewer tiled experiment]" << line;
+    }
+
+    void rejectStart(const QString& reason)
+    {
+        _status->setText(reason);
+        trace(tr("Startup stopped after %1 ms · %2").arg(_startupClock.elapsed()).arg(reason));
+    }
+
+    void beginStage(const QString& name)
+    {
+        _stageClock.start();
+        _stageName = name;
+        trace(tr("Trial %1 · Started %2").arg(_trial).arg(name));
+    }
+
+    void endStage(const QString& detail = {})
+    {
+        if (!_stageClock.isValid())
+            return;
+        const auto message = tr("Trial %1 · %2 · %3 ms").arg(_trial).arg(_stageName).arg(_stageClock.elapsed());
+        trace(detail.isEmpty() ? message : message + QStringLiteral(" · ") + detail);
+        _stageClock.invalidate();
+    }
     bool validateWorkloads(mv::plugin::ViewPlugin* genes)
     {
         _selectedWorkloads = _workloads.getSelectedOptions();
         if (_selectedWorkloads.isEmpty()) {
-            _status->setText(tr("Select at least one workload."));
+            rejectStart(tr("Select at least one workload."));
             return false;
         }
         _genes = genes;
         if (analysisWindow(false) || analysisWindow(true)) {
-            _status->setText(tr("Close the Differential Expression and Trait Analysis windows before starting."));
+            rejectStart(tr("Close the Differential Expression and Trait Analysis windows before starting."));
             return false;
         }
         _de = action<TriggerAction>(genes, QStringLiteral("Species Differential Expression..."));
         _correlation = action<TriggerAction>(genes, QStringLiteral("Trait Analysis"));
         if ((_selectedWorkloads.contains(deName()) && !_de) ||
             (_selectedWorkloads.contains(correlationName()) && !_correlation)) {
-            _status->setText(tr("A selected Gene Identification workload is unavailable."));
+            rejectStart(tr("A selected Gene Identification workload is unavailable."));
             return false;
         }
         if (_selectedWorkloads.contains(correlationName())) {
             auto* trait = action<StringAction>(genes, QStringLiteral("Reverse Search Trait Selection String"));
             if (!trait || trait->getString().trimmed().isEmpty()) {
-                _status->setText(tr("Choose a trait in Gene Identification before benchmarking correlation."));
+                rejectStart(tr("Choose a trait in Gene Identification before benchmarking correlation."));
                 return false;
             }
         }
@@ -278,68 +308,92 @@ private:
 
     void start()
     {
+        _log->clear();
+        _startupClock.start();
+        trace(tr("Start clicked · checking project and Gene Identification"));
         if (!mv::projects().getCurrentProject() || mv::projects().isOpeningProject()) {
-            _status->setText(tr("Open a project before starting."));
+            rejectStart(tr("Open a project before starting."));
             return;
         }
 
         auto* factory = mv::plugins().getPluginFactory(QStringLiteral("XSCGeneDetect"));
         if (!factory) {
-            _status->setText(tr("Gene Identification is unavailable."));
+            rejectStart(tr("Gene Identification is unavailable."));
             return;
         }
         const auto instances = mv::plugins().getPluginsByFactory(factory);
         if (instances.size() != 1) {
-            _status->setText(tr("Open exactly one Gene Identification view."));
+            rejectStart(tr("Open exactly one Gene Identification view."));
             return;
         }
         auto* genes = dynamic_cast<mv::plugin::ViewPlugin*>(instances.front());
-        if (!genes || !validateWorkloads(genes))
+        if (!genes) {
+            rejectStart(tr("The Gene Identification instance is not a view."));
+            return;
+        }
+        if (!validateWorkloads(genes))
             return;
 
-        for (const auto* title : {"Main Points Dataset", "Reference Tree Dataset", "Embedding Dataset",
-                                  "Species Names", "Bottom Cluster Names", "Middle Cluster Names", "Top Cluster Names"}) {
-            auto* picker = action<DatasetPickerAction>(genes, QString::fromUtf8(title));
-            if (!picker || !picker->getCurrentDataset().isValid()) {
-                _status->setText(tr("Configure the Gene Identification dataset “%1”.").arg(QString::fromUtf8(title)));
+        trace(tr("Workloads selected · %1").arg(_selectedWorkloads.join(QStringLiteral(", "))));
+        _picker = action<DatasetPickerAction>(genes, QStringLiteral("Main Points Dataset"));
+        _update = action<TriggerAction>(genes, QStringLiteral("Update"));
+        _geneStatus = action<StringAction>(genes, QStringLiteral("Status color"));
+        if (!_picker || !_update || !_geneStatus) {
+            rejectStart(tr("Could not find the Gene Identification main dataset, Update button, or status action."));
+            return;
+        }
+        if (geneUpdateRunning()) {
+            rejectStart(tr("Wait for the current Gene Identification Update to finish."));
+            return;
+        }
+        if (!_picker->getCurrentDataset().isValid()) {
+            rejectStart(tr("Configure the Gene Identification main points dataset."));
+            return;
+        }
+
+        const auto mainId = _picker->getCurrentDatasetId();
+        for (const auto* title : {"Reference Tree Dataset", "Embedding Dataset", "Species Names", "Bottom Cluster Names"}) {
+            const auto label = QString::fromUtf8(title);
+            auto* picker = action<DatasetPickerAction>(genes, label);
+            const auto dataset = picker ? picker->getCurrentDataset() : mv::Dataset<>();
+            if (!dataset.isValid()) {
+                rejectStart(tr("Configure the Gene Identification dataset “%1”.").arg(label));
+                return;
+            }
+            if (label != QStringLiteral("Reference Tree Dataset") &&
+                (!dataset->getParent().isValid() || dataset->getParent()->getId() != mainId)) {
+                rejectStart(tr("“%1” must be a child of the Gene Identification main points dataset.").arg(label));
                 return;
             }
         }
 
-        _picker = action<DatasetPickerAction>(genes, QStringLiteral("Main Points Dataset"));
-        _update = action<TriggerAction>(genes, QStringLiteral("Update"));
-        _geneStatus = action<StringAction>(genes, QStringLiteral("Status color"));
-        if (!_update || !_geneStatus || _geneStatus->getString() == QStringLiteral("R") ||
-            (!_update->isEnabled() && _geneStatus->getString() != QStringLiteral("C"))) {
-            _status->setText(tr("Gene Identification must be available and idle."));
-            return;
+        trace(tr("Gene Identification input datasets validated"));
+        if (!_outputPath.isEmpty()) {
+            QSaveFile output(_outputPath);
+            if (!output.open(QIODevice::WriteOnly)) {
+                rejectStart(tr("Cannot write the preset (%1). Choose another automatic output location.").arg(output.errorString()));
+                return;
+            }
+            output.cancelWriting();
         }
-
-        if (_outputPath.isEmpty()) {
-            _status->setText(tr("Choose where to save the best HDF5 Loader preset."));
-            return;
-        }
-
-        QSaveFile output(_outputPath);
-        if (!output.open(QIODevice::WriteOnly)) {
-            _status->setText(tr("Cannot write the preset (%1).").arg(output.errorString()));
-            return;
-        }
-        output.cancelWriting();
-
         _points = _picker->getCurrentDataset<Points>();
         if (!_points.isValid() || !_points->isFull() || _points->isProxy() || _points->isLocked() || !backend()) {
-            _status->setText(tr("Choose a full, unlocked main dataset with tiled storage."));
+            rejectStart(tr("Choose a full, unlocked main dataset with tiled storage."));
             return;
         }
         auto original = backend()->getStorage();
         _clusters = _clusterPicker.getCurrentDataset<Clusters>();
         const auto names = _clusterOptions.getSelectedOptions();
-        if (!_clusters.isValid() || _clusters->getParent().get() != mv::Dataset<>(_points).get() || names.isEmpty()) {
-            _status->setText(tr("Choose a cluster dataset belonging to the Gene Identification main points and select at least one cluster."));
+        if (!_clusters.isValid() || !_clusters->getParent().isValid() || _clusters->getParent()->getId() != mainId) {
+            rejectStart(tr("Choose a cluster dataset directly under “%1”.").arg(_points->getGuiName()));
+            return;
+        }
+        if (names.isEmpty()) {
+            rejectStart(tr("Select at least one cluster in the Clusters picker."));
             return;
         }
 
+        trace(tr("Resolving cells from %1 · %2").arg(_clusters->getGuiName(), names.join(QStringLiteral(", "))));
         _selection.clear();
         _clusterIndices.clear();
         const auto& clusters = _clusters->getClusters();
@@ -354,7 +408,7 @@ private:
         _selection.erase(std::unique(_selection.begin(), _selection.end()), _selection.end());
         if (_selection.size() < 2 || original->rows() == 0 || original->columns() == 0 ||
             _selection.back() >= original->rows() || _points->getDimensionNames().empty()) {
-            _status->setText(tr("The chosen clusters need at least two valid cells in a non-empty tiled dataset with gene names."));
+            rejectStart(tr("The chosen clusters need at least two valid cells in a non-empty tiled dataset with gene names."));
             return;
         }
 
@@ -400,12 +454,13 @@ private:
         _phase = Phase::Next;
         _active = true;
         _stopped = _paused = false;
-        _log->clear();
         _results->reset(_clusters->getGuiName(), names.join(QStringLiteral(", ")),
                         _selectedWorkloads.join(QStringLiteral(", ")), _selectedWorkloads.contains(updateName()));
-        _log->appendPlainText(tr("Benchmark selection: %1 / %2 (%3 cells)").arg(_clusters->getGuiName(), names.join(QStringLiteral(", "))).arg(_selection.size()));
+        trace(tr("Benchmark selection: %1 / %2 (%3 cells)").arg(_clusters->getGuiName(), names.join(QStringLiteral(", "))).arg(_selection.size()));
         _elementTypeIndex = backend()->getElementTypeIndex();
         _total.start();
+        trace(tr("Startup checks passed in %1 ms · %2 rows × %3 genes · %4 min budget")
+            .arg(_startupClock.elapsed()).arg(_rows).arg(_columns).arg(_budget->value()));
         updateControls();
         scheduleNext();
     }
@@ -463,11 +518,20 @@ private:
         QTimer::singleShot(0, this, [this]() { advance(); });
     }
 
+    static bool geneUpdateRunning()
+    {
+        for (auto* task : mv::tasks().getTasks())
+            if (task && task->getName() == QStringLiteral("Update selection statistics") &&
+                (task->getStatus() == mv::Task::Status::Running || task->getStatus() == mv::Task::Status::RunningIndeterminate))
+                return true;
+        return false;
+    }
+
     bool inputsMatch()
     {
         return _picker && _update && _geneStatus && _points.isValid() && _clusters.isValid() &&
             _clusters->getSelectionIndices() == (_appliedClusterSelection ? _clusterIndices : _previousClusterIndices) &&
-            _picker->getCurrentDataset().get() == mv::Dataset<>(_points).get() &&
+            _picker->getCurrentDatasetId() == _points->getId() &&
             backend() && backend()->getStorage() == _installed &&
             _points->getSelectionIndices() == _expected;
     }
@@ -480,7 +544,7 @@ private:
             finish(tr("Stopped"));
             return;
         }
-        if (!inputsMatch() || _geneStatus->getString() == QStringLiteral("R")) {
+        if (!inputsMatch() || geneUpdateRunning()) {
             finish(tr("Dataset, selection, or Gene Identification changed during the experiment"));
             return;
         }
@@ -522,6 +586,8 @@ private:
 
     void convert()
     {
+        beginStage(tr("storage update · tile %1 × %2, cache %3, super-tile %4 × %5")
+            .arg(_candidate[0]).arg(_candidate[1]).arg(_candidate[2]).arg(_candidate[3]).arg(_candidate[4]));
         _status->setText(tr("Trial %1 · Rebuilding tiled storage").arg(_trial));
         _status->repaint();
         _progress->setRange(0, 100);
@@ -559,12 +625,14 @@ private:
             return;
         }
         _conversionMs = timer.elapsed();
+        endStage(tr("Storage ready"));
         _phase = Phase::Measure;
         scheduleNext();
     }
 
     void runUpdate(const std::vector<std::uint32_t>& selection, const QString& label)
     {
+        beginStage(label);
         _status->setText(tr("Trial %1 · %2").arg(_trial).arg(label));
         _progress->setRange(0, 0);
         if (_clusterIndices.back() >= static_cast<std::size_t>(_clusters->getClusters().size())) {
@@ -573,21 +641,23 @@ private:
         }
         _clusters->setSelectionIndices(_clusterIndices);
         _appliedClusterSelection = true;
-        _expected = _selection;
-        if (_points->getSelectionIndices() != _expected) {
-            finish(tr("The selected clusters no longer match the benchmark cells"));
+        // Linked selection handlers can rewrite the points after the cluster action.
+        // Set the exact rows for this update after those handlers have run.
+        _expected = selection;
+        if (_points->getSelectionIndices() != _expected)
+            _points->setSelectionIndices(_expected);
+        if (!inputsMatch()) {
+            finish(tr("Could not apply the benchmark selection to the main points dataset"));
             return;
         }
-        if (_phase != Phase::Measure) {
-            // Only the untimed cache preparation uses a subset of the chosen cells.
-            _expected = selection;
-            _points->setSelectionIndices(_expected);
-        }
+        trace(tr("Trial %1 · Applied %2 cluster selections and %3 cells · invoking Gene Identification Update")
+            .arg(_trial).arg(_clusterIndices.size()).arg(_expected.size()));
         // The completed status normally disables Update for an unchanged selection.
         _update->setEnabled(true);
         _completionMs = -1;
         _observedRunning = false;
         _completionConnection = connect(_geneStatus, &StringAction::stringChanged, this, [this](const QString& status) {
+            trace(tr("Trial %1 · Gene Identification status %2 after %3 ms").arg(_trial).arg(status).arg(_operation.elapsed()));
             if (status == QStringLiteral("R"))
                 _observedRunning = true;
             else if (_observedRunning && _completionMs < 0)
@@ -613,7 +683,7 @@ private:
             return;
         }
         const auto status = _geneStatus->getString();
-        if (status == QStringLiteral("R")) {
+        if (geneUpdateRunning() || (status == QStringLiteral("R") && _operation.elapsed() < 5000)) {
             _status->setText(tr("Trial %1 · %2 · %3 s").arg(_trial)
                 .arg(_stopped ? tr("Stopping after Update") : _paused ? tr("Pausing after Update") :
                      _phase == Phase::Measure ? tr("Timing Gene Identification") : tr("Preparing Gene Identification"))
@@ -623,10 +693,16 @@ private:
 
         _poll.stop();
         disconnect(_completionConnection);
-        if (!_observedRunning || status != QStringLiteral("C") || !inputsMatch()) {
-            finish(tr("Gene Identification did not complete with the benchmark selection"));
+        if (!_observedRunning || status != QStringLiteral("C")) {
+            finish(tr("Gene Identification %1 did not complete (status %2). Check the Gene Identification view.")
+                .arg(_phase == Phase::Measure ? tr("Update") : tr("preparation"), status.isEmpty() ? tr("unavailable") : status));
             return;
         }
+        if (!inputsMatch()) {
+            finish(tr("The benchmark selection, main dataset, or storage changed during Gene Identification Update"));
+            return;
+        }
+        endStage(tr("Update completed with the expected selection"));
         if (_phase == Phase::Measure) {
             _updateMs = _completionMs >= 0 ? _completionMs : _operation.elapsed();
             _trialScore = _selectedWorkloads.contains(updateName()) ? _updateMs : 0;
@@ -659,7 +735,10 @@ private:
                     ? name.startsWith(QStringLiteral("Trait correlation"))
                     : name == QStringLiteral("Differential expression");
                 if (matches && (status == mv::Task::Status::Running || status == mv::Task::Status::RunningIndeterminate))
+                {
                     _analysisTask = task;
+                    trace(tr("Trial %1 · %2 task running").arg(_trial).arg(name));
+                }
                 if (task == _analysisTask && (status == mv::Task::Status::Finished || status == mv::Task::Status::Aborted))
                     _analysisMs = _operation.elapsed();
             }));
@@ -681,6 +760,7 @@ private:
             return;
         }
 
+        beginStage(name);
         ++_analysisGeneration;
         _analysisOwner = trigger->parent();
         _analysisTask.clear();
@@ -736,6 +816,7 @@ private:
             return;
         }
         const auto elapsed = _analysisMs >= 0 ? _analysisMs : _operation.elapsed();
+        endStage(tr("Task completed · measured %1 ms").arg(elapsed));
         _trialScore += elapsed;
         if (name == correlationName())
             _correlationMs = elapsed;
@@ -779,7 +860,10 @@ private:
         _poll.stop();
         disconnect(_completionConnection);
         closeAnalysis();
+        endStage(message);
+        trace(tr("Ending experiment · %1").arg(message));
         if (backend() && backend()->getStorage() == _installed && _converted) {
+            beginStage(tr("restoring original tiled storage settings"));
             _status->setText(tr("Restoring the original tiled storage settings…"));
             _status->repaint();
             _progress->setRange(0, 100);
@@ -788,8 +872,9 @@ private:
                     _progress->setValue(qRound(fraction * 100));
                     _progress->repaint();
                 });
+                endStage(tr("Original settings restored"));
             } catch (const std::exception& error) {
-                _log->appendPlainText(tr("Could not restore the original settings (%1)").arg(QString::fromUtf8(error.what())));
+                endStage(tr("Could not restore the original settings (%1)").arg(QString::fromUtf8(error.what())));
             }
         }
         if (_points.isValid() && _points->getSelectionIndices() == _expected) {
@@ -809,7 +894,8 @@ private:
         _progress->setValue(1);
         _status->setText(tr("%1 · %2 trials · %3 s elapsed").arg(message).arg(_trial).arg(_total.elapsed() / 1000));
         updateControls();
-        if (_bestMs >= 0)
+        trace(_status->text());
+        if (_bestMs >= 0 && !_outputPath.isEmpty())
             writePreset(_outputPath);
     }
 
@@ -854,9 +940,9 @@ private:
             QSaveFile file(path);
             if (!file.open(QIODevice::WriteOnly) || file.write(json) != json.size() || !file.commit())
                 throw std::runtime_error(file.errorString().toStdString());
-            _log->appendPlainText(tr("Saved preset to %1").arg(path));
+            trace(tr("Saved preset to %1").arg(path));
         } catch (const std::exception& error) {
-            _log->appendPlainText(tr("Could not save preset (%1)").arg(QString::fromUtf8(error.what())));
+            trace(tr("Could not save preset (%1)").arg(QString::fromUtf8(error.what())));
         }
     }
 
@@ -889,6 +975,9 @@ private:
     QPlainTextEdit* _log = nullptr;
     QTimer _poll;
     QElapsedTimer _operation;
+    QElapsedTimer _startupClock;
+    QElapsedTimer _stageClock;
+    QString _stageName;
     QElapsedTimer _total;
     QElapsedTimer _pauseClock;
 
