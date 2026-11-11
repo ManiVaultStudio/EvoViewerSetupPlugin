@@ -2,12 +2,16 @@
 
 #include <AbstractPluginManager.h>
 #include <AbstractProjectManager.h>
+#include <AbstractTaskManager.h>
+#include <Task.h>
 #include <CoreInterface.h>
+#include <ClusterData/ClusterData.h>
 #include <PointData/PointData.h>
 #include <PointData/storage/tiled/PointDataTiledStorage.h>
 #include <PointData/storage/tiled/TiledPointsStorageBackend.h>
 #include <PointData/storage/tiled/TiledStorageBackendConfigurationAction.h>
 #include <actions/DatasetPickerAction.h>
+#include <actions/OptionsAction.h>
 #include <actions/StringAction.h>
 #include <actions/TriggerAction.h>
 
@@ -16,6 +20,8 @@
 #include <QGroupBox>
 #include <QJsonDocument>
 #include <QSaveFile>
+#include <QShowEvent>
+#include <QFormLayout>
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPointer>
@@ -55,12 +61,33 @@ T* action(mv::plugin::ViewPlugin* view, const QString& title)
 class Experiment final : public QWidget
 {
 public:
-    explicit Experiment(QWidget* parent) : QWidget(parent)
+    explicit Experiment(QWidget* parent) :
+        QWidget(parent),
+        _clusterPicker(this, tr("Cluster dataset")),
+        _clusterOptions(this, tr("Clusters")),
+        _workloads(this, tr("Workloads"), {updateName(), deName(), correlationName()}, {updateName()})
     {
         auto* layout = new QVBoxLayout(this);
         auto* group = new QGroupBox(tr("Experiments"), this);
         layout->addWidget(group);
         auto* controls = new QVBoxLayout(group);
+        auto* selection = new QFormLayout;
+        selection->addRow(tr("Cluster dataset"), _clusterPicker.createWidget(group));
+        selection->addRow(tr("Clusters"), _clusterOptions.createWidget(group));
+        selection->addRow(tr("Workloads"), _workloads.createWidget(group));
+        controls->addLayout(selection);
+        _clusterPicker.setFilterFunction([](const mv::Dataset<>& dataset) {
+            if (!dataset.isValid() || dataset->getDataType() != ::ClusterType)
+                return false;
+            const auto parent = dataset->getParent();
+            return parent.isValid() && parent->getDataType() == ::PointType &&
+                mv::Dataset<Points>(parent)->getStorageBackendType() == StorageBackendType::Tiled;
+        });
+        connect(&_clusterPicker, &DatasetPickerAction::currentIndexChanged, this, [this]() {
+            updateClusterOptions();
+        });
+        updateClusterOptions();
+
         auto* budget = new QHBoxLayout;
         budget->addWidget(new QLabel(tr("Time budget (minutes)"), group));
         _budget = new QSpinBox(group);
@@ -90,7 +117,7 @@ public:
             buttons->addWidget(button);
         controls->addLayout(buttons);
 
-        _status = new QLabel(tr("Select cells in EvoViewer to benchmark tiled storage for Gene Identification."), group);
+        _status = new QLabel(tr("Choose a cluster dataset and one or more clusters to benchmark."), group);
         _status->setWordWrap(true);
         controls->addWidget(_status);
         _progress = new QProgressBar(group);
@@ -126,8 +153,96 @@ public:
         updateControls();
     }
 
+protected:
+    void showEvent(QShowEvent* event) override
+    {
+        QWidget::showEvent(event);
+        if (_defaultChecked || _active)
+            return;
+        for (const auto& dataset : _clusterPicker.getDatasets()) {
+            auto name = dataset->getGuiName();
+            name.replace(QLatin1Char('_'), QLatin1Char(' '));
+            if (name.simplified().compare(QStringLiteral("Consensus Subclass"), Qt::CaseInsensitive) == 0) {
+                _clusterPicker.setCurrentDataset(dataset);
+                break;
+            }
+        }
+        updateClusterOptions();
+        _defaultChecked = !_clusterPicker.getDatasets().isEmpty();
+    }
+
 private:
-    enum class Phase { Next, Convert, Measure };
+    void updateClusterOptions()
+    {
+        QStringList names;
+        const auto dataset = _clusterPicker.getCurrentDataset<Clusters>();
+        if (dataset.isValid())
+            for (const auto& cluster : dataset->getClusters())
+                names << cluster.getName();
+        names.removeDuplicates();
+
+        const auto previous = _clusterOptions.getSelectedOptions();
+        const bool sameDataset = _optionsDatasetId == _clusterPicker.getCurrentDatasetId();
+        _optionsDatasetId = _clusterPicker.getCurrentDatasetId();
+        _clusterOptions.setOptions(names, true);
+        QStringList selected;
+        if (sameDataset)
+            for (const auto& name : previous)
+                if (names.contains(name))
+                    selected << name;
+        if (!sameDataset && names.contains(QStringLiteral("L5 IT")))
+            selected << QStringLiteral("L5 IT");
+        _clusterOptions.setSelectedOptions(selected);
+    }
+
+    enum class Phase { Next, Convert, Measure, Analyze };
+
+    static QString updateName() { return tr("Update"); }
+    static QString deName() { return tr("Differential expression"); }
+    static QString correlationName() { return tr("Trait correlation"); }
+
+    QWidget* analysisWindow(bool correlation) const
+    {
+        if (!_genes)
+            return nullptr;
+        for (auto* widget : _genes->getWidget().findChildren<QWidget*>()) {
+            const auto title = widget->windowTitle();
+            if (widget->isWindow() && (correlation
+                ? title.endsWith(QStringLiteral("trait plots"), Qt::CaseInsensitive)
+                : title == QStringLiteral("Species differential expression")))
+                return widget;
+        }
+        return nullptr;
+    }
+
+    bool validateWorkloads(mv::plugin::ViewPlugin* genes)
+    {
+        _selectedWorkloads = _workloads.getSelectedOptions();
+        if (_selectedWorkloads.isEmpty()) {
+            _status->setText(tr("Select at least one workload."));
+            return false;
+        }
+        _genes = genes;
+        if (analysisWindow(false) || analysisWindow(true)) {
+            _status->setText(tr("Close the Differential Expression and Trait Analysis windows before starting."));
+            return false;
+        }
+        _de = action<TriggerAction>(genes, QStringLiteral("Species Differential Expression..."));
+        _correlation = action<TriggerAction>(genes, QStringLiteral("Trait Analysis"));
+        if ((_selectedWorkloads.contains(deName()) && !_de) ||
+            (_selectedWorkloads.contains(correlationName()) && !_correlation)) {
+            _status->setText(tr("A selected Gene Identification workload is unavailable."));
+            return false;
+        }
+        if (_selectedWorkloads.contains(correlationName())) {
+            auto* trait = action<StringAction>(genes, QStringLiteral("Reverse Search Trait Selection String"));
+            if (!trait || trait->getString().trimmed().isEmpty()) {
+                _status->setText(tr("Choose a trait in Gene Identification before benchmarking correlation."));
+                return false;
+            }
+        }
+        return true;
+    }
 
     const TiledPointsStorageBackend* backend() const
     {
@@ -141,6 +256,9 @@ private:
         _start->setEnabled(!_active);
         _budget->setEnabled(!_active);
         _output->setEnabled(!_active);
+        _clusterPicker.setEnabled(!_active);
+        _clusterOptions.setEnabled(!_active);
+        _workloads.setEnabled(!_active);
         _pause->setEnabled(_active && !_stopped);
         _pause->setText(_paused ? tr("Resume") : tr("Pause"));
         _stop->setEnabled(_active && !_stopped);
@@ -165,7 +283,7 @@ private:
             return;
         }
         auto* genes = dynamic_cast<mv::plugin::ViewPlugin*>(instances.front());
-        if (!genes)
+        if (!genes || !validateWorkloads(genes))
             return;
 
         for (const auto* title : {"Main Points Dataset", "Reference Tree Dataset", "Embedding Dataset",
@@ -204,12 +322,28 @@ private:
             return;
         }
         auto original = backend()->getStorage();
-        _selection = _points->getSelectionIndices();
+        _clusters = _clusterPicker.getCurrentDataset<Clusters>();
+        const auto names = _clusterOptions.getSelectedOptions();
+        if (!_clusters.isValid() || _clusters->getParent().get() != mv::Dataset<>(_points).get() || names.isEmpty()) {
+            _status->setText(tr("Choose a cluster dataset belonging to the Gene Identification main points and select at least one cluster."));
+            return;
+        }
+
+        _selection.clear();
+        _clusterIndices.clear();
+        const auto& clusters = _clusters->getClusters();
+        for (qsizetype index = 0; index < clusters.size(); ++index) {
+            const auto& cluster = clusters.at(index);
+            if (!names.contains(cluster.getName()))
+                continue;
+            _clusterIndices.push_back(static_cast<std::uint32_t>(index));
+            _selection.insert(_selection.end(), cluster.getIndices().begin(), cluster.getIndices().end());
+        }
         std::sort(_selection.begin(), _selection.end());
         _selection.erase(std::unique(_selection.begin(), _selection.end()), _selection.end());
         if (_selection.size() < 2 || original->rows() == 0 || original->columns() == 0 ||
             _selection.back() >= original->rows() || _points->getDimensionNames().empty()) {
-            _status->setText(tr("Select at least two cells in a non-empty tiled dataset."));
+            _status->setText(tr("The chosen clusters need at least two valid cells in a non-empty tiled dataset with gene names."));
             return;
         }
 
@@ -234,7 +368,10 @@ private:
             _candidate[3] = _candidate[4] = 1;
         }
         _primer.assign(_selection.begin(), _selection.begin() + std::min<std::size_t>(32, _selection.size() / 2));
-        _expected = _points->getSelectionIndices();
+        _previousSelection = _points->getSelectionIndices();
+        _expected = _previousSelection;
+        _previousClusterIndices = _clusters->getSelectionIndices();
+        _appliedClusterSelection = false;
         _best = _candidate;
         _center = _candidate;
         _bestMs = -1;
@@ -253,6 +390,7 @@ private:
         _active = true;
         _stopped = _paused = false;
         _log->clear();
+        _log->appendPlainText(tr("Benchmark selection: %1 / %2 (%3 cells)").arg(_clusters->getGuiName(), names.join(QStringLiteral(", "))).arg(_selection.size()));
         _elementTypeIndex = backend()->getElementTypeIndex();
         _total.start();
         updateControls();
@@ -314,7 +452,8 @@ private:
 
     bool inputsMatch()
     {
-        return _picker && _update && _geneStatus && _points.isValid() &&
+        return _picker && _update && _geneStatus && _points.isValid() && _clusters.isValid() &&
+            _clusters->getSelectionIndices() == (_appliedClusterSelection ? _clusterIndices : _previousClusterIndices) &&
             _picker->getCurrentDataset().get() == mv::Dataset<>(_points).get() &&
             backend() && backend()->getStorage() == _installed &&
             _points->getSelectionIndices() == _expected;
@@ -355,6 +494,10 @@ private:
             // Replace Gene Identification's selection cache before rebuilding storage.
             // Every timed update then uses the same full selection on newly built tiles.
             runUpdate(_primer, tr("Preparing a fresh Gene Identification run"));
+            return;
+        }
+        if (_phase == Phase::Analyze) {
+            runAnalysis();
             return;
         }
         if (_phase == Phase::Convert) {
@@ -411,8 +554,22 @@ private:
     {
         _status->setText(tr("Trial %1 · %2").arg(_trial).arg(label));
         _progress->setRange(0, 0);
-        _expected = selection;
-        _points->setSelectionIndices(_expected);
+        if (_clusterIndices.back() >= static_cast<std::size_t>(_clusters->getClusters().size())) {
+            finish(tr("The cluster dataset changed during the experiment"));
+            return;
+        }
+        _clusters->setSelectionIndices(_clusterIndices);
+        _appliedClusterSelection = true;
+        _expected = _selection;
+        if (_points->getSelectionIndices() != _expected) {
+            finish(tr("The selected clusters no longer match the benchmark cells"));
+            return;
+        }
+        if (_phase != Phase::Measure) {
+            // Only the untimed cache preparation uses a subset of the chosen cells.
+            _expected = selection;
+            _points->setSelectionIndices(_expected);
+        }
         // The completed status normally disables Update for an unchanged selection.
         _update->setEnabled(true);
         _completionMs = -1;
@@ -434,6 +591,10 @@ private:
     {
         if (_launching)
             return;
+        if (_phase == Phase::Analyze) {
+            pollAnalysis();
+            return;
+        }
         if (!_geneStatus) {
             finish(tr("Gene Identification was closed"));
             return;
@@ -454,29 +615,146 @@ private:
             return;
         }
         if (_phase == Phase::Measure) {
-            const auto elapsed = _completionMs >= 0 ? _completionMs : _operation.elapsed();
-            _lastTrialMs = _total.elapsed() - _pausedMs - _trialStartedMs;
-            _estimatedTrialMs = _trial == 1 ? _lastTrialMs : (_estimatedTrialMs + _lastTrialMs) / 2;
-            if (_sweepBestMs < 0)
-                _sweepBestMs = elapsed;
-            if (_bestMs < 0 || elapsed < _bestMs) {
-                _bestMs = elapsed;
-                _best = _candidate;
-            }
-            _log->appendPlainText(tr("%1. Tile %2 × %3, cache %4, super-tile %5 × %6 · storage %7 ms · Update %8 ms · best %9 ms")
-                .arg(_trial).arg(_candidate[0]).arg(_candidate[1]).arg(_candidate[2])
-                .arg(_candidate[3]).arg(_candidate[4]).arg(_conversionMs).arg(elapsed).arg(_bestMs));
-            _phase = Phase::Next;
+            _updateMs = _completionMs >= 0 ? _completionMs : _operation.elapsed();
+            _trialScore = _selectedWorkloads.contains(updateName()) ? _updateMs : 0;
+            _analyses.clear();
+            for (const auto& workload : {deName(), correlationName()})
+                if (_selectedWorkloads.contains(workload))
+                    _analyses << workload;
+            _analysisTimings.clear();
+            if (_analyses.isEmpty())
+                recordTrial();
+            else
+                _phase = Phase::Analyze;
         } else {
             _phase = Phase::Convert;
         }
         scheduleNext();
     }
 
+    void watchAnalysisTask(mv::Task* task)
+    {
+        if (!task || task->parent() != _analysisOwner)
+            return;
+        _analysisConnections.push_back(connect(task, &mv::Task::statusChanged, this,
+            [this, task, generation = _analysisGeneration](mv::Task::Status, mv::Task::Status status) {
+                if (!_poll.isActive() || _phase != Phase::Analyze || generation != _analysisGeneration)
+                    return;
+                const auto name = task->getName();
+                const bool matches = _analyses.front() == correlationName()
+                    ? name.startsWith(QStringLiteral("Trait correlation"))
+                    : name == QStringLiteral("Differential expression");
+                if (matches && (status == mv::Task::Status::Running || status == mv::Task::Status::RunningIndeterminate))
+                    _analysisTask = task;
+                if (task == _analysisTask && (status == mv::Task::Status::Finished || status == mv::Task::Status::Aborted))
+                    _analysisMs = _operation.elapsed();
+            }));
+    }
+
+    void runAnalysis()
+    {
+        const auto name = _analyses.front();
+        const bool correlation = name == correlationName();
+        auto* trigger = correlation ? _correlation.data() : _de.data();
+        if (!trigger || !trigger->isEnabled() || analysisWindow(correlation)) {
+            finish(tr("%1 is unavailable or its window is already open").arg(name));
+            return;
+        }
+
+        _clusters->setSelectionIndices(_clusterIndices);
+        if (!inputsMatch()) {
+            finish(tr("The selected clusters no longer match the benchmark cells"));
+            return;
+        }
+
+        ++_analysisGeneration;
+        _analysisOwner = trigger->parent();
+        _analysisTask.clear();
+        _analysisMs = -1;
+        _taskAdded = connect(&mv::tasks(), &mv::AbstractTaskManager::taskAdded,
+                             this, [this](mv::Task* task) { watchAnalysisTask(task); });
+        for (auto* task : _analysisOwner->findChildren<mv::Task*>(QString(), Qt::FindDirectChildrenOnly))
+            watchAnalysisTask(task);
+
+        _status->setText(tr("Trial %1 · %2").arg(_trial).arg(name));
+        _progress->setRange(0, 0);
+        _operation.start();
+        _launching = true;
+        _poll.start();
+        trigger->trigger();
+        _analysisWindow = analysisWindow(correlation);
+        _launching = false;
+    }
+
+    void closeAnalysis()
+    {
+        ++_analysisGeneration;
+        disconnect(_taskAdded);
+        for (const auto& connection : _analysisConnections)
+            disconnect(connection);
+        _analysisConnections.clear();
+        if (_analysisWindow)
+            _analysisWindow->close();
+        _analysisWindow.clear();
+        _analysisTask.clear();
+    }
+
+    void pollAnalysis()
+    {
+        const auto name = _analyses.front();
+        if (!_genes || !_analysisWindow || (!_analysisTask && _operation.elapsed() >= 5000)) {
+            finish(tr("%1 did not start. Check the Gene Identification settings and selected cells").arg(name));
+            return;
+        }
+        if (!_analysisTask || (_analysisTask->getStatus() != mv::Task::Status::Finished &&
+                              _analysisTask->getStatus() != mv::Task::Status::Aborted)) {
+            _status->setText(tr("Trial %1 · %2 · %3 s").arg(_trial).arg(name).arg(_operation.elapsed() / 1000));
+            if (_analysisTask) {
+                _progress->setRange(0, 100);
+                _progress->setValue(qRound(100 * _analysisTask->getProgress()));
+            }
+            return;
+        }
+
+        _poll.stop();
+        if (_analysisTask->getStatus() != mv::Task::Status::Finished || !inputsMatch()) {
+            finish(tr("%1 did not complete with the benchmark selection").arg(name));
+            return;
+        }
+        const auto elapsed = _analysisMs >= 0 ? _analysisMs : _operation.elapsed();
+        _trialScore += elapsed;
+        _analysisTimings << tr("%1 %2 ms").arg(name).arg(elapsed);
+        closeAnalysis();
+        _analyses.removeFirst();
+        if (_analyses.isEmpty())
+            recordTrial();
+        scheduleNext();
+    }
+
+    void recordTrial()
+    {
+        _lastTrialMs = _total.elapsed() - _pausedMs - _trialStartedMs;
+        _estimatedTrialMs = _trial == 1 ? _lastTrialMs : (_estimatedTrialMs + _lastTrialMs) / 2;
+        if (_sweepBestMs < 0)
+            _sweepBestMs = _trialScore;
+        if (_bestMs < 0 || _trialScore < _bestMs) {
+            _bestMs = _trialScore;
+            _best = _candidate;
+        }
+        const auto updateTiming = _selectedWorkloads.contains(updateName()) ? tr("Update %1 ms").arg(_updateMs)
+            : tr("Update preparation %1 ms (excluded)").arg(_updateMs);
+        _analysisTimings.prepend(updateTiming);
+        _log->appendPlainText(tr("%1. Tile %2 × %3, cache %4, super-tile %5 × %6 · storage %7 ms · %8 · score %9 ms · best %10 ms")
+            .arg(_trial).arg(_candidate[0]).arg(_candidate[1]).arg(_candidate[2])
+            .arg(_candidate[3]).arg(_candidate[4]).arg(_conversionMs).arg(_analysisTimings.join(QStringLiteral(" · ")))
+            .arg(_trialScore).arg(_bestMs));
+        _phase = Phase::Next;
+    }
     void finish(const QString& message)
     {
         _poll.stop();
         disconnect(_completionConnection);
+        closeAnalysis();
         if (backend() && backend()->getStorage() == _installed && _converted) {
             _status->setText(tr("Restoring the original tiled storage settings…"));
             _status->repaint();
@@ -490,8 +768,16 @@ private:
                 _log->appendPlainText(tr("Could not restore the original settings (%1)").arg(QString::fromUtf8(error.what())));
             }
         }
-        if (_points.isValid() && _points->getSelectionIndices() == _expected && _expected != _selection)
-            _points->setSelectionIndices(_selection);
+        if (_points.isValid() && _points->getSelectionIndices() == _expected) {
+            if (_clusters.isValid() && _appliedClusterSelection &&
+                _clusters->getSelectionIndices() == _clusterIndices &&
+                std::all_of(_previousClusterIndices.begin(), _previousClusterIndices.end(), [this](auto index) {
+                    return index < static_cast<std::size_t>(_clusters->getClusters().size());
+                }))
+                _clusters->setSelectionIndices(_previousClusterIndices);
+            if (_points->getSelectionIndices() != _previousSelection)
+                _points->setSelectionIndices(_previousSelection);
+        }
 
         _installed.reset();
         _active = _paused = _stopped = false;
@@ -534,6 +820,21 @@ private:
         }
     }
 
+    DatasetPickerAction _clusterPicker;
+    OptionsAction _clusterOptions;
+    OptionsAction _workloads;
+    QStringList _selectedWorkloads, _analyses, _analysisTimings;
+    QPointer<mv::plugin::ViewPlugin> _genes;
+    QPointer<TriggerAction> _de, _correlation;
+    QPointer<QWidget> _analysisWindow;
+    QPointer<QObject> _analysisOwner;
+    QPointer<mv::Task> _analysisTask;
+    QMetaObject::Connection _taskAdded;
+    std::vector<QMetaObject::Connection> _analysisConnections;
+    quint64 _analysisGeneration = 0;
+    qint64 _analysisMs = -1, _updateMs = 0, _trialScore = 0;
+    QString _optionsDatasetId;
+    bool _defaultChecked = false;
     QSpinBox* _budget = nullptr;
     QPushButton* _output = nullptr;
     QString _outputPath;
@@ -553,8 +854,13 @@ private:
     QPointer<TriggerAction> _update;
     QPointer<StringAction> _geneStatus;
     mv::Dataset<Points> _points;
+    mv::Dataset<Clusters> _clusters;
+    std::vector<std::uint32_t> _clusterIndices;
+    std::vector<std::uint32_t> _previousClusterIndices;
+    bool _appliedClusterSelection = false;
     std::shared_ptr<Storage> _installed;
     std::vector<std::uint32_t> _selection;
+    std::vector<std::uint32_t> _previousSelection;
     std::vector<std::uint32_t> _primer;
     std::vector<std::uint32_t> _expected;
     std::set<Candidate> _visited;
