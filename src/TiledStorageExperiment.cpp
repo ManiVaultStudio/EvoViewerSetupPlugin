@@ -459,7 +459,7 @@ private:
         _columns = _installed->columns();
         _elementSize = _installed->elementSize();
         _lower = {1, 1, 1, 1, 1};
-        _upper = {std::min<std::size_t>(_rows, 65536), std::min<std::size_t>(_columns, 4096), 8192, 32, 32};
+        _upper = {std::min<std::size_t>(_rows, 65536), std::min<std::size_t>(_columns, 65536), 8192, 32, 32};
         const auto current = backend()->createConversionAction(StorageBackendType::Tiled, nullptr);
         _initial = static_cast<TiledStorageBackendConfigurationAction*>(current.get())->getConfiguration();
         const auto& initial = _initial;
@@ -483,6 +483,10 @@ private:
         _lastTrialMs = 0;
         _estimatedTrialMs = 0;
         _completedTrials = 0;
+        _failedRebuilds = 0;
+        _consecutiveRebuildFailures = 0;
+        _bestFeasibleMs = -1;
+        _cacheProbeTried = false;
         _pausedMs = 0;
         _pauseClock.invalidate();
         _packedSeedTried = false;
@@ -527,13 +531,32 @@ private:
             && c[4] <= (_columns + c[1] - 1) / c[1];
     }
 
+    bool canRebuild(const Candidate& candidate) const
+    {
+        return validCandidate(candidate) && packedFileCount(candidate) <= maxPackedFiles;
+    }
+
     bool selectCandidate()
     {
-        if (!_packedSeedTried && (packedFileCount(_center) > maxPackedFiles || !_initial.packedTiles)) {
+        // Establish a second measurement without a full rebuild whenever possible.
+        if (!_cacheProbeTried) {
+            _cacheProbeTried = true;
+            auto cacheProbe = _baseline;
+            cacheProbe[2] = cacheProbe[2] > 1 ? cacheProbe[2] / 2 : 2;
+            if (matchesInstalledLayout(configuration(cacheProbe)) && _visited.insert(cacheProbe).second) {
+                _candidate = cacheProbe;
+                return true;
+            }
+        }
+        if (!_packedSeedTried && (packedFileCount(_center) > maxPackedFiles || !validCandidate(_center) || !_initial.packedTiles)) {
             _packedSeedTried = true;
             auto seed = _center;
             for (std::size_t axis = 0; axis < seed.size(); ++axis)
                 seed[axis] = std::clamp(seed[axis], _lower[axis], _upper[axis]);
+            for (const int axis : {3, 4, 0, 1}) {
+                while (!validCandidate(seed) && seed[axis] > _lower[axis])
+                    seed[axis] = std::max(_lower[axis], seed[axis] / 2);
+            }
             while (packedFileCount(seed) > maxPackedFiles) {
                 const auto previous = seed;
                 for (const int axis : {3, 4, 0, 1}) {
@@ -547,7 +570,7 @@ private:
                 if (seed == previous)
                     break;
             }
-            if (validCandidate(seed) && packedFileCount(seed) <= maxPackedFiles &&
+            if (canRebuild(seed) &&
                 _visited.insert(seed).second) {
                 _candidate = seed;
                 return true;
@@ -556,10 +579,13 @@ private:
         while (_radius >= 0.125) {
             if (_direction == 10) {
                 // Reduce the search radius when a complete sweep fails to improve by 2%.
-                if (_sweepBestMs >= 0 && _bestMs >= 0.98 * _sweepBestMs)
+                // Keep exploring around the fastest rebuildable layout even if
+                // the installed layout still holds the best overall score.
+                const auto searchScore = _bestFeasibleMs >= 0 ? _bestFeasibleMs : _bestMs;
+                if (_sweepBestMs >= 0 && searchScore >= 0.98 * _sweepBestMs)
                     _radius /= 2;
-                _sweepBestMs = _bestMs;
-                _center = _best;
+                _sweepBestMs = searchScore;
+                _center = _bestFeasibleMs >= 0 ? _bestFeasible : _best;
                 _direction = 0;
                 continue;
             }
@@ -572,8 +598,8 @@ private:
                 : std::min<qint64>(value - 1, std::llround(value / (1.0 + _radius)));
             candidate[axis] = std::clamp(neighbor,
                                          static_cast<qint64>(_lower[axis]), static_cast<qint64>(_upper[axis]));
-            if (validCandidate(candidate) &&
-                (matchesInstalledLayout(configuration(candidate)) || packedFileCount(candidate) <= maxPackedFiles) &&
+            if ((matchesInstalledLayout(configuration(candidate)) ||
+                 canRebuild(candidate)) &&
                 _visited.insert(candidate).second) {
                 _candidate = candidate;
                 return true;
@@ -591,7 +617,9 @@ private:
         config.columnTileSize = candidate[1];
         config.cacheCapacity = candidate[2];
         config.cacheCapacityBytes = _cacheBytes;
-        config.packedTiles = true;
+        const bool sameGeometry = candidate[0] == _baseline[0] && candidate[1] == _baseline[1] &&
+            candidate[3] == _baseline[3] && candidate[4] == _baseline[4];
+        config.packedTiles = sameGeometry ? _initial.packedTiles : true;
         config.superTileRows = candidate[3];
         config.superTileColumns = candidate[4];
         return config;
@@ -649,7 +677,11 @@ private:
                 return;
             }
             if (_trial > 0 && !selectCandidate()) {
-                finish(tr("Search converged"));
+                if (_failedRebuilds)
+                    finish(tr("Search ended with %1 failed rebuilds").arg(_failedRebuilds));
+                else
+                    finish(_completedTrials > 1 ? tr("Search converged") :
+                        tr("Baseline only · no eligible alternative layout was found"));
                 return;
             }
             ++_trial;
@@ -741,9 +773,20 @@ private:
                 _converted = true;
             }
         } catch (const std::exception& error) {
-            finish(tr("Storage update failed (%1)").arg(QString::fromUtf8(error.what())));
+            const auto reason = tr("Storage update failed (%1)").arg(QString::fromUtf8(error.what()));
+            ++_failedRebuilds;
+            ++_consecutiveRebuildFailures;
+            if (_bestMs >= 0 && _consecutiveRebuildFailures < 3 && inputsMatch()) {
+                endStage(reason);
+                trace(tr("Skipping failed candidate · keeping completed results"));
+                _phase = Phase::Next;
+                scheduleNext();
+            } else {
+                finish(reason);
+            }
             return;
         }
+        _consecutiveRebuildFailures = 0;
         _conversionMs = timer.elapsed();
         endStage(tr("Storage ready"));
         _phase = Phase::Measure;
@@ -1027,6 +1070,10 @@ private:
     void recordTrial()
     {
         ++_completedTrials;
+        if (canRebuild(_candidate) && (_bestFeasibleMs < 0 || _trialScore < _bestFeasibleMs)) {
+            _bestFeasible = _candidate;
+            _bestFeasibleMs = _trialScore;
+        }
         _lastTrialMs = _total.elapsed() - _pausedMs - _trialStartedMs;
         _estimatedTrialMs = _trial == 1 ? _lastTrialMs : (_estimatedTrialMs + _lastTrialMs) / 2;
         if (_sweepBestMs < 0)
@@ -1224,6 +1271,11 @@ private:
     qint64 _lastTrialMs = 0;
     qint64 _estimatedTrialMs = 0;
     int _completedTrials = 0;
+    int _failedRebuilds = 0;
+    int _consecutiveRebuildFailures = 0;
+    qint64 _bestFeasibleMs = -1;
+    Candidate _bestFeasible{};
+    bool _cacheProbeTried = false;
     qint64 _conversionMs = 0;
     qint64 _completionMs = -1;
     std::uint32_t _elementTypeIndex = 0;
