@@ -4,6 +4,7 @@
 #include <AbstractPluginManager.h>
 #include <AbstractProjectManager.h>
 #include <AbstractTaskManager.h>
+#include <AbstractEventManager.h>
 #include <Task.h>
 #include <CoreInterface.h>
 #include <ClusterData/ClusterData.h>
@@ -41,6 +42,7 @@
 #include <array>
 #include <cmath>
 #include <set>
+#include <iterator>
 
 namespace
 {
@@ -408,12 +410,48 @@ private:
         }
         std::sort(_selection.begin(), _selection.end());
         _selection.erase(std::unique(_selection.begin(), _selection.end()), _selection.end());
+        // Gene Identification groups by its bottom-level clusters. Keep only
+        // cells with a matching label at both levels (e.g. L5 IT and L5 IT_1).
+        _bottomPicker = action<DatasetPickerAction>(genes, QStringLiteral("Bottom Cluster Names"));
+        const auto bottom = _bottomPicker->getCurrentDataset<Clusters>();
+        _bottomDatasetId = bottom->getId();
+        if (bottom->getId() != _clusters->getId()) {
+            std::vector<std::uint32_t> matching;
+            QStringList labels;
+            for (const auto& cluster : bottom->getClusters()) {
+                const auto label = cluster.getName().simplified();
+                for (const auto& name : names) {
+                    const auto prefix = name.simplified();
+                    const auto suffix = label.mid(prefix.size());
+                    bool numbered = false;
+                    if (suffix.startsWith(QLatin1Char('_')) || suffix.startsWith(QLatin1Char(' ')))
+                        suffix.mid(1).toUInt(&numbered);
+                    if (label.compare(prefix, Qt::CaseInsensitive) != 0 &&
+                        !(numbered && label.startsWith(prefix, Qt::CaseInsensitive)))
+                        continue;
+                    labels << cluster.getName();
+                    matching.insert(matching.end(), cluster.getIndices().begin(), cluster.getIndices().end());
+                    break;
+                }
+            }
+            std::sort(matching.begin(), matching.end());
+            std::vector<std::uint32_t> intersection;
+            std::set_intersection(_selection.begin(), _selection.end(), matching.begin(), matching.end(),
+                                  std::back_inserter(intersection));
+            if (intersection.empty()) {
+                rejectStart(tr("No cells match the selected clusters in Gene Identification's bottom-level labels."));
+                return;
+            }
+            _selection = std::move(intersection);
+            trace(tr("Restricted benchmark to %1 · %2 cells").arg(labels.join(QStringLiteral(", "))).arg(_selection.size()));
+        }
         if (_selection.size() < 2 || original->rows() == 0 || original->columns() == 0 ||
             _selection.back() >= original->rows() || _points->getDimensionNames().empty()) {
             rejectStart(tr("The chosen clusters need at least two valid cells in a non-empty tiled dataset with gene names."));
             return;
         }
 
+        _originalStorage = original;
         _installed = std::move(original);
         _converted = false;
         _cacheAdjusted = false;
@@ -444,7 +482,7 @@ private:
         _sweepBestMs = -1;
         _lastTrialMs = 0;
         _estimatedTrialMs = 0;
-        _estimatedRestoreMs = 0;
+        _completedTrials = 0;
         _pausedMs = 0;
         _pauseClock.invalidate();
         _packedSeedTried = false;
@@ -529,8 +567,10 @@ private:
             const int axis = direction / 2;
             auto candidate = _center;
             const auto value = static_cast<qint64>(candidate[axis]);
-            const auto stride = std::max<qint64>(1, std::llround(value * _radius));
-            candidate[axis] = std::clamp(value + (direction % 2 ? stride : -stride),
+            const auto neighbor = direction % 2
+                ? std::max<qint64>(value + 1, std::llround(value * (1.0 + _radius)))
+                : std::min<qint64>(value - 1, std::llround(value / (1.0 + _radius)));
+            candidate[axis] = std::clamp(neighbor,
                                          static_cast<qint64>(_lower[axis]), static_cast<qint64>(_upper[axis]));
             if (validCandidate(candidate) &&
                 (matchesInstalledLayout(configuration(candidate)) || packedFileCount(candidate) <= maxPackedFiles) &&
@@ -576,6 +616,7 @@ private:
     {
         return _picker && _update && _geneStatus && _points.isValid() && _clusters.isValid() &&
             _picker->getCurrentDatasetId() == _points->getId() &&
+            _bottomPicker && _bottomPicker->getCurrentDatasetId() == _bottomDatasetId &&
             !_points->isLocked() && _clusters->getParent().isValid() &&
             _clusters->getParent()->getId() == _points->getId() &&
             backend() && backend()->getStorage() == _installed;
@@ -603,7 +644,7 @@ private:
             const auto budgetMs = qint64(_budget->value()) * 60 * 1000;
             const auto elapsedMs = _total.elapsed() - _pausedMs;
             const auto nextTrialMs = std::max(_lastTrialMs, _estimatedTrialMs);
-            if (_trial > 0 && (elapsedMs >= budgetMs || nextTrialMs + _estimatedRestoreMs > budgetMs - elapsedMs)) {
+            if (_trial > 0 && (elapsedMs >= budgetMs || nextTrialMs > budgetMs - elapsedMs)) {
                 finish(tr("Time budget reached or another trial is unlikely to fit"));
                 return;
             }
@@ -684,7 +725,7 @@ private:
                         dialog.setLabelText(tr("Rebuilding tiled storage · %1% · %2 s")
                             .arg(fraction * 100.0, 0, 'f', 2).arg(elapsed / 1000));
                         dialog.setValue(qRound(fraction * 10000));
-                        if (dialog.wasCanceled()) {
+                        if (dialog.wasCanceled() || _total.elapsed() - _pausedMs >= qint64(_budget->value()) * 60000) {
                             cancelled = true;
                             throw std::runtime_error("Tiled storage rebuild cancelled");
                         }
@@ -693,12 +734,11 @@ private:
                 } catch (...) {
                     if (!cancelled)
                         throw;
-                    finish(tr("Stopped during storage rebuild"));
+                    finish(dialog.wasCanceled() ? tr("Stopped during storage rebuild") : tr("Time budget reached during storage rebuild"));
                     return;
                 }
                 _installed = backend()->getStorage();
                 _converted = true;
-                _estimatedRestoreMs = std::max(_estimatedRestoreMs, timer.elapsed());
             }
         } catch (const std::exception& error) {
             finish(tr("Storage update failed (%1)").arg(QString::fromUtf8(error.what())));
@@ -853,6 +893,18 @@ private:
                 .arg(_trial).arg(cells.size()).arg(clusters.size()));
         _expected = cells;
         _lastClusterSelection = clusters;
+        if (_phase == Phase::Next)
+            return; // Leave the untimed primer alone until the measured selection is applied.
+        if (_expected != _selection || _lastClusterSelection != _clusterIndices) {
+            _clusters->setSelectionIndices(_clusterIndices);
+            if (_points->getSelectionIndices() != _selection)
+                _points->setSelectionIndices(_selection);
+            mv::events().notifyDatasetDataSelectionChanged(mv::Dataset<>(_points));
+            _expected = _points->getSelectionIndices();
+            _lastClusterSelection = _clusters->getSelectionIndices();
+            trace(tr("Trial %1 · Reapplied the benchmark selection after publication (%2 cells)")
+                .arg(_trial).arg(_expected.size()));
+        }
     }
 
     void watchAnalysisTask(mv::Task* task)
@@ -974,6 +1026,7 @@ private:
 
     void recordTrial()
     {
+        ++_completedTrials;
         _lastTrialMs = _total.elapsed() - _pausedMs - _trialStartedMs;
         _estimatedTrialMs = _trial == 1 ? _lastTrialMs : (_estimatedTrialMs + _lastTrialMs) / 2;
         if (_sweepBestMs < 0)
@@ -1004,6 +1057,8 @@ private:
         closeAnalysis();
         endStage(message);
         trace(tr("Ending experiment · %1").arg(message));
+        if (_bestMs >= 0 && !_outputPath.isEmpty())
+            writePreset(_outputPath);
         if (backend() && backend()->getStorage() == _installed && (_converted || _cacheAdjusted)) {
             beginStage(tr("restoring original tiled storage settings"));
             _status->setText(tr("Restoring the original tiled storage settings…"));
@@ -1013,10 +1068,25 @@ private:
                 if (matchesInstalledLayout(_initial)) {
                     _points->configureStorageBackend(std::make_shared<StorageBackendConfiguration>(_initial));
                 } else {
-                    _points->convertToStorageBackend(StorageBackendType::Tiled, _initial, [this](float fraction) {
-                    _progress->setValue(qRound(fraction * 100));
-                    _progress->repaint();
-                    });
+                    auto* factory = mv::plugins().getPluginFactory(QStringLiteral("Points"));
+                    PointData* raw = nullptr;
+                    if (factory)
+                        for (auto* plugin : mv::plugins().getPluginsByFactory(factory))
+                            if (plugin->getName() == _points->getRawDataName()) {
+                                raw = dynamic_cast<PointData*>(plugin);
+                                break;
+                            }
+                    if (!raw)
+                        throw std::runtime_error("Original point-data owner is unavailable");
+                    {
+                        const auto lock = raw->lockData();
+                        const auto* current = dynamic_cast<const TiledPointsStorageBackend*>(raw->getStorageBackend());
+                        if (!current || current->getStorage() != _installed)
+                            throw std::runtime_error("Point storage changed before restoration");
+                        const_cast<TiledPointsStorageBackend*>(current)->setStorage(_originalStorage);
+                    }
+                    _installed = _originalStorage;
+                    _points->configureStorageBackend(std::make_shared<StorageBackendConfiguration>(_initial));
                 }
                 endStage(tr("Original settings restored"));
             } catch (const std::exception& error) {
@@ -1035,14 +1105,13 @@ private:
         }
 
         _installed.reset();
+        _originalStorage.reset();
         _active = _paused = _stopped = false;
         _progress->setRange(0, 1);
         _progress->setValue(1);
-        _status->setText(tr("%1 · %2 trials · %3 s elapsed").arg(message).arg(_trial).arg(_total.elapsed() / 1000));
+        _status->setText(tr("%1 · %2 completed trials · %3 s elapsed").arg(message).arg(_completedTrials).arg(_total.elapsed() / 1000));
         updateControls();
         trace(_status->text());
-        if (_bestMs >= 0 && !_outputPath.isEmpty())
-            writePreset(_outputPath);
     }
 
     QString choosePresetPath()
@@ -1127,7 +1196,8 @@ private:
     QElapsedTimer _total;
     QElapsedTimer _pauseClock;
 
-    QPointer<DatasetPickerAction> _picker;
+    QPointer<DatasetPickerAction> _picker, _bottomPicker;
+    QString _bottomDatasetId;
     QPointer<TriggerAction> _update;
     QPointer<StringAction> _geneStatus;
     mv::Dataset<Points> _points;
@@ -1137,6 +1207,7 @@ private:
     std::vector<std::uint32_t> _lastClusterSelection;
     bool _appliedClusterSelection = false;
     std::shared_ptr<Storage> _installed;
+    std::shared_ptr<Storage> _originalStorage;
     std::vector<std::uint32_t> _selection;
     std::vector<std::uint32_t> _previousSelection;
     std::vector<std::uint32_t> _primer;
@@ -1152,7 +1223,7 @@ private:
     qint64 _trialStartedMs = 0;
     qint64 _lastTrialMs = 0;
     qint64 _estimatedTrialMs = 0;
-    qint64 _estimatedRestoreMs = 0;
+    int _completedTrials = 0;
     qint64 _conversionMs = 0;
     qint64 _completionMs = -1;
     std::uint32_t _elementTypeIndex = 0;
