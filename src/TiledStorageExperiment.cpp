@@ -521,7 +521,8 @@ private:
     static bool geneUpdateRunning()
     {
         for (auto* task : mv::tasks().getTasks())
-            if (task && task->getName() == QStringLiteral("Update selection statistics") &&
+            if (task && (task->getName() == QStringLiteral("Update selection statistics") ||
+                         task->getName() == QStringLiteral("Compute gene mean expression map")) &&
                 (task->getStatus() == mv::Task::Status::Running || task->getStatus() == mv::Task::Status::RunningIndeterminate))
                 return true;
         return false;
@@ -655,21 +656,45 @@ private:
         // The completed status normally disables Update for an unchanged selection.
         _update->setEnabled(true);
         _completionMs = -1;
-        _observedRunning = false;
+        _workflowFinishedMs = -1;
+        _workflowSeen = _workflowAborted = false;
+        _updateTask.clear();
+        _operation.start();
         _completionConnection = connect(_geneStatus, &StringAction::stringChanged, this, [this](const QString& status) {
             trace(tr("Trial %1 · Gene Identification status %2 after %3 ms").arg(_trial).arg(status).arg(_operation.elapsed()));
-            if (status == QStringLiteral("R"))
-                _observedRunning = true;
-            else if (_observedRunning && _completionMs < 0)
+            if (_workflowSeen && status == QStringLiteral("C"))
                 _completionMs = _operation.elapsed();
         });
-        _operation.start();
+        _updateTaskAdded = connect(&mv::tasks(), &mv::AbstractTaskManager::taskAdded, this, [this](mv::Task* task) {
+            if (!_launching || _workflowSeen || task->getName() != QStringLiteral("Update selection statistics"))
+                return;
+            _workflowSeen = true;
+            _updateTask = task;
+            trace(tr("Trial %1 · Captured Gene Identification Update workflow").arg(_trial));
+            _updateTaskStatus = connect(task, &mv::Task::statusChanged, this,
+                [this](mv::Task::Status, mv::Task::Status status) {
+                    if (status != mv::Task::Status::Finished && status != mv::Task::Status::Aborted)
+                        return;
+                    _workflowFinishedMs = _operation.elapsed();
+                    _workflowAborted = status == mv::Task::Status::Aborted;
+                    trace(tr("Trial %1 · Update workflow %2 after %3 ms").arg(_trial)
+                        .arg(_workflowAborted ? tr("aborted") : tr("finished")).arg(_workflowFinishedMs));
+                });
+        });
         _poll.start();
         _launching = true;
         _update->trigger();
         _launching = false;
+        disconnect(_updateTaskAdded);
     }
 
+    void disconnectUpdate()
+    {
+        disconnect(_updateTaskAdded);
+        disconnect(_updateTaskStatus);
+        disconnect(_completionConnection);
+        _updateTask.clear();
+    }
     void pollUpdate()
     {
         if (_launching)
@@ -682,20 +707,34 @@ private:
             finish(tr("Gene Identification was closed"));
             return;
         }
-        const auto status = _geneStatus->getString();
-        if (geneUpdateRunning() || (status == QStringLiteral("R") && _operation.elapsed() < 5000)) {
+        const auto elapsed = _operation.elapsed();
+        if (!_workflowSeen || _workflowFinishedMs < 0) {
+            if ((!_workflowSeen || !_updateTask) && elapsed >= 5000) {
+                finish(_workflowSeen ? tr("The Update workflow disappeared before reporting completion")
+                                     : tr("Gene Identification did not start an Update workflow"));
+                return;
+            }
             _status->setText(tr("Trial %1 · %2 · %3 s").arg(_trial)
                 .arg(_stopped ? tr("Stopping after Update") : _paused ? tr("Pausing after Update") :
                      _phase == Phase::Measure ? tr("Timing Gene Identification") : tr("Preparing Gene Identification"))
-                .arg(_operation.elapsed() / 1000));
+                .arg(elapsed / 1000));
+            if (_updateTask) {
+                _progress->setRange(0, 100);
+                _progress->setValue(qRound(100 * _updateTask->getProgress()));
+            }
             return;
         }
 
+        // The workflow task completes before Gene Identification publishes its outcome.
+        // Selection events can report M while the task is still running.
+        if (!_workflowAborted && _completionMs < 0 && elapsed - _workflowFinishedMs < 2000)
+            return;
+
         _poll.stop();
-        disconnect(_completionConnection);
-        if (!_observedRunning || status != QStringLiteral("C")) {
+        disconnectUpdate();
+        if (_workflowAborted || _completionMs < 0) {
             finish(tr("Gene Identification %1 did not complete (status %2). Check the Gene Identification view.")
-                .arg(_phase == Phase::Measure ? tr("Update") : tr("preparation"), status.isEmpty() ? tr("unavailable") : status));
+                .arg(_phase == Phase::Measure ? tr("Update") : tr("preparation"), _geneStatus->getString()));
             return;
         }
         if (!inputsMatch()) {
@@ -858,7 +897,7 @@ private:
     void finish(const QString& message)
     {
         _poll.stop();
-        disconnect(_completionConnection);
+        disconnectUpdate();
         closeAnalysis();
         endStage(message);
         trace(tr("Ending experiment · %1").arg(message));
@@ -1010,7 +1049,11 @@ private:
     qint64 _completionMs = -1;
     std::uint32_t _elementTypeIndex = 0;
     QMetaObject::Connection _completionConnection;
-    bool _observedRunning = false;
+    QPointer<mv::Task> _updateTask;
+    QMetaObject::Connection _updateTaskAdded, _updateTaskStatus;
+    qint64 _workflowFinishedMs = -1;
+    bool _workflowSeen = false;
+    bool _workflowAborted = false;
     double _radius = 1.0;
     int _trial = 0;
     int _direction = 0;
