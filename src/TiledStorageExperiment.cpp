@@ -1,4 +1,5 @@
 #include "EvoViewerSetupPlugin.h"
+#include "TiledStorageTrialResults.h"
 
 #include <AbstractPluginManager.h>
 #include <AbstractProjectManager.h>
@@ -23,6 +24,7 @@
 #include <QShowEvent>
 #include <QFormLayout>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QProgressBar>
@@ -125,8 +127,16 @@ public:
         _log = new QPlainTextEdit(group);
         _log->setReadOnly(true);
         controls->addWidget(_log);
-        _save = new QPushButton(tr("Save best HDF5 Loader preset…"), group);
-        controls->addWidget(_save);
+        _showResults = new QPushButton(tr("View and export results…"), group);
+        controls->addWidget(_showResults);
+        _results = new EvoViewerSetup::TrialResults(this);
+        connect(_showResults, &QPushButton::clicked, _results, [this]() {
+            _results->show();
+            _results->raise();
+            _results->activateWindow();
+        });
+        connect(_results->csvButton(), &QPushButton::clicked, this, [this]() { exportCsv(); });
+        connect(_results->presetButton(), &QPushButton::clicked, this, [this]() { savePreset(); });
 
         _poll.setInterval(50);
         connect(&_poll, &QTimer::timeout, this, [this]() { pollUpdate(); });
@@ -149,7 +159,6 @@ public:
             if (!_poll.isActive())
                 scheduleNext();
         });
-        connect(_save, &QPushButton::clicked, this, [this]() { savePreset(); });
         updateControls();
     }
 
@@ -262,7 +271,9 @@ private:
         _pause->setEnabled(_active && !_stopped);
         _pause->setText(_paused ? tr("Resume") : tr("Pause"));
         _stop->setEnabled(_active && !_stopped);
-        _save->setEnabled(!_active && _bestMs >= 0);
+        _showResults->setEnabled(_bestMs >= 0);
+        _results->csvButton()->setEnabled(_bestMs >= 0);
+        _results->presetButton()->setEnabled(_bestMs >= 0 && !_active);
     }
 
     void start()
@@ -390,6 +401,8 @@ private:
         _active = true;
         _stopped = _paused = false;
         _log->clear();
+        _results->reset(_clusters->getGuiName(), names.join(QStringLiteral(", ")),
+                        _selectedWorkloads.join(QStringLiteral(", ")), _selectedWorkloads.contains(updateName()));
         _log->appendPlainText(tr("Benchmark selection: %1 / %2 (%3 cells)").arg(_clusters->getGuiName(), names.join(QStringLiteral(", "))).arg(_selection.size()));
         _elementTypeIndex = backend()->getElementTypeIndex();
         _total.start();
@@ -622,6 +635,7 @@ private:
                 if (_selectedWorkloads.contains(workload))
                     _analyses << workload;
             _analysisTimings.clear();
+            _deMs = _correlationMs = -1;
             if (_analyses.isEmpty())
                 recordTrial();
             else
@@ -723,6 +737,10 @@ private:
         }
         const auto elapsed = _analysisMs >= 0 ? _analysisMs : _operation.elapsed();
         _trialScore += elapsed;
+        if (name == correlationName())
+            _correlationMs = elapsed;
+        else
+            _deMs = elapsed;
         _analysisTimings << tr("%1 %2 ms").arg(name).arg(elapsed);
         closeAnalysis();
         _analyses.removeFirst();
@@ -737,10 +755,16 @@ private:
         _estimatedTrialMs = _trial == 1 ? _lastTrialMs : (_estimatedTrialMs + _lastTrialMs) / 2;
         if (_sweepBestMs < 0)
             _sweepBestMs = _trialScore;
-        if (_bestMs < 0 || _trialScore < _bestMs) {
+        const bool best = _bestMs < 0 || _trialScore < _bestMs;
+        if (best) {
             _bestMs = _trialScore;
             _best = _candidate;
         }
+        _results->append({_trial, static_cast<qint64>(_candidate[0]), static_cast<qint64>(_candidate[1]),
+                          static_cast<qint64>(_candidate[2]), static_cast<qint64>(_candidate[3]),
+                          static_cast<qint64>(_candidate[4]), _conversionMs, _updateMs, _deMs,
+                          _correlationMs, _trialScore}, best);
+        updateControls();
         const auto updateTiming = _selectedWorkloads.contains(updateName()) ? tr("Update %1 ms").arg(_updateMs)
             : tr("Update preparation %1 ms (excluded)").arg(_updateMs);
         _analysisTimings.prepend(updateTiming);
@@ -791,11 +815,27 @@ private:
 
     QString choosePresetPath()
     {
-        auto path = QFileDialog::getSaveFileName(this, tr("Save tiled storage preset"),
+        auto* parent = _results->isVisible() ? static_cast<QWidget*>(_results) : this;
+        auto path = QFileDialog::getSaveFileName(parent, tr("Save tiled storage preset"),
             QStringLiteral("EvoViewer Tiled Storage.mvp"), tr("ManiVault View Preset (*.mvp)"));
         if (!path.isEmpty() && !path.endsWith(QStringLiteral(".mvp"), Qt::CaseInsensitive))
             path += QStringLiteral(".mvp");
         return path;
+    }
+
+    void exportCsv()
+    {
+        auto path = QFileDialog::getSaveFileName(_results, tr("Export trial results"),
+            QStringLiteral("EvoViewer Tiled Storage Trials.csv"), tr("CSV files (*.csv)"));
+        if (path.isEmpty())
+            return;
+        if (!path.endsWith(QStringLiteral(".csv"), Qt::CaseInsensitive))
+            path += QStringLiteral(".csv");
+        QString error;
+        if (_results->writeCsv(path, error))
+            _log->appendPlainText(tr("Exported trial data to %1").arg(path));
+        else
+            QMessageBox::warning(_results, tr("Could not export trial data"), error);
     }
 
     void savePreset()
@@ -833,6 +873,7 @@ private:
     std::vector<QMetaObject::Connection> _analysisConnections;
     quint64 _analysisGeneration = 0;
     qint64 _analysisMs = -1, _updateMs = 0, _trialScore = 0;
+    qint64 _deMs = -1, _correlationMs = -1;
     QString _optionsDatasetId;
     bool _defaultChecked = false;
     QSpinBox* _budget = nullptr;
@@ -841,7 +882,8 @@ private:
     QPushButton* _start = nullptr;
     QPushButton* _pause = nullptr;
     QPushButton* _stop = nullptr;
-    QPushButton* _save = nullptr;
+    QPushButton* _showResults = nullptr;
+    EvoViewerSetup::TrialResults* _results = nullptr;
     QLabel* _status = nullptr;
     QProgressBar* _progress = nullptr;
     QPlainTextEdit* _log = nullptr;
