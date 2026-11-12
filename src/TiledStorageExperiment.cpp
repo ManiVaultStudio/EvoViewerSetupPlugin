@@ -99,7 +99,7 @@ public:
         auto* budget = new QHBoxLayout;
         budget->addWidget(new QLabel(tr("Time budget (minutes)"), group));
         _budget = new QSpinBox(group);
-        _budget->setRange(1, 240);
+        _budget->setRange(1, 800);
         _budget->setValue(15);
         _budget->setToolTip(tr("The search can finish early when improvements level off. An operation already in progress runs to completion."));
         budget->addWidget(_budget);
