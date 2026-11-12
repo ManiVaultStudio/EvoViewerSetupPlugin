@@ -3,6 +3,7 @@
 #include "EvoViewerSetupData.h"
 
 #include <CoreInterface.h>
+#include <Application.h>
 #include <Dataset.h>
 #include <Project.h>
 #include <Workspace.h>
@@ -361,7 +362,8 @@ void EvoViewerSetupPlugin::finishStudioMode()
 {
     const auto project = _setupProject;
     _setupProject.clear();
-    if (project && project == mv::projects().getCurrentProject() && !setProjectStudioMode(false))
+    if (project && mv::Application::core() && !mv::Application::core()->isAboutToBeDestroyed() &&
+        project == mv::projects().getCurrentProject() && !setProjectStudioMode(false))
         qWarning() << "EvoViewer setup: could not disable Studio Mode.";
 }
 

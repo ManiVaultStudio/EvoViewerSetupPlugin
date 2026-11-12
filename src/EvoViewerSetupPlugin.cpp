@@ -3,6 +3,7 @@
 #include "EvoViewerSetupRequirements.h"
 
 #include <AbstractDataManager.h>
+#include <Application.h>
 #include <AbstractPluginManager.h>
 #include <AbstractProjectManager.h>
 #include <CoreInterface.h>
@@ -52,6 +53,8 @@ EvoViewerSetupPlugin::EvoViewerSetupPlugin(const mv::plugin::PluginFactory* fact
 
 void EvoViewerSetupPlugin::init()
 {
+    connect(mv::Application::core(), &mv::CoreInterface::aboutToBeDestroyed,
+        this, &EvoViewerSetupPlugin::finishStudioMode);
     initializeExperiments();
     _setupStarted = false;
     QTimer::singleShot(0, this, &EvoViewerSetupPlugin::setupWorkspace);
