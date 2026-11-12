@@ -6,6 +6,12 @@ The EvoViewer Setup Plugin prepares one ManiVault workspace for the Cytosplore E
 
 The plugin is intentionally the only place where this workspace orchestration is implemented. Other plugins keep ownership of their own views, controls, and data behavior.
 
+## Handing off a configured project
+
+Destroy the EvoViewer Setup instance before saving or publishing the project. The workspace keeps the configured views, datasets, and action connections, which are saved through ManiVault's existing project serialization. Hiding the setup view alone leaves an instance in the project.
+
+For a published project, enable **Allowed plugins only** and exclude **EvoViewer Setup Plugin** from that list. Destroy the instance before publishing because ManiVault adds plugin kinds currently in use to the allowed list. If you distribute a separate ManiVault build, you can omit the setup plugin from that build.
+
 ## Source layout
 
 - `EvoViewerSetupPlugin.cpp` owns plugin creation, startup, and the debounced menu-availability refresh.

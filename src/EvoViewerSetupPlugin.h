@@ -1,6 +1,9 @@
 #pragma once
 
 #include <ViewPlugin.h>
+#include <QPointer>
+
+namespace mv { class Project; }
 
 class EvoViewerSetupPlugin final : public mv::plugin::ViewPlugin
 {
@@ -8,12 +11,16 @@ class EvoViewerSetupPlugin final : public mv::plugin::ViewPlugin
 
 public:
     explicit EvoViewerSetupPlugin(const mv::plugin::PluginFactory* factory);
+    ~EvoViewerSetupPlugin() override;
     void init() override;
 
 private:
     void setupWorkspace();
     void initializeExperiments();
 
+    void finishStudioMode();
+
+    QPointer<mv::Project> _setupProject;
     bool _setupStarted = false;
 };
 
@@ -34,5 +41,4 @@ private:
     void scheduleAvailabilityUpdate();
 
     bool _availabilityUpdateScheduled = false;
-    bool _setupAvailable = false;
 };

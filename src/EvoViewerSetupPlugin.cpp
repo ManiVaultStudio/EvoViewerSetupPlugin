@@ -7,6 +7,7 @@
 #include <AbstractProjectManager.h>
 #include <CoreInterface.h>
 #include <Plugin.h>
+#include <Project.h>
 
 #include <QTimer>
 
@@ -58,15 +59,16 @@ void EvoViewerSetupPluginFactory::scheduleAvailabilityUpdate()
 
 void EvoViewerSetupPluginFactory::updateAvailability()
 {
-    const bool setupAvailable = EvoViewerSetup::requiredPluginsAvailable() &&
+    const auto* project = mv::projects().getCurrentProject();
+    const bool allowedByProject = !project || !project->getReadOnlyAction().isChecked() ||
+        !project->getAllowedPluginsOnlyAction().isChecked() ||
+        project->getAllowedPluginsAction().getStrings().contains(getKind());
+
+    const bool setupAvailable = allowedByProject && EvoViewerSetup::requiredPluginsAvailable() &&
         EvoViewerSetup::requiredTreeDatasetsAvailable() &&
         !EvoViewerSetup::eligibleMainPointDatasets().isEmpty();
 
-    if (setupAvailable == _setupAvailable)
-        return;
-
-    _setupAvailable = setupAvailable;
-    setAllowPluginCreationFromStandardGui(_setupAvailable);
+    setAllowPluginCreationFromStandardGui(setupAvailable);
 }
 
 mv::plugin::ViewPlugin* EvoViewerSetupPluginFactory::produce()

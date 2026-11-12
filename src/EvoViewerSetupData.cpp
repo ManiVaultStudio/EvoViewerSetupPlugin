@@ -48,7 +48,7 @@ Datasets datasetsOfType(const QString& type)
     return matches;
 }
 
-bool chooseDatasets(const Datasets& mainPointsCandidates, DatasetChoices& choices)
+bool chooseDatasets(const Datasets& mainPointsCandidates, DatasetChoices& choices, QObject* setup)
 {
     const auto allTrees = datasetsOfType(QLatin1String(TREE_TYPE));
     const auto allMetadata = datasetsOfType(QLatin1String(TREE_METADATA_TYPE));
@@ -156,6 +156,7 @@ bool chooseDatasets(const Datasets& mainPointsCandidates, DatasetChoices& choice
     updateDependentDatasets();
     updateAcceptEnabled();
 
+    QObject::connect(setup, &QObject::destroyed, &dialog, &QDialog::reject);
     if (dialog.exec() != QDialog::Accepted)
         return false;
 

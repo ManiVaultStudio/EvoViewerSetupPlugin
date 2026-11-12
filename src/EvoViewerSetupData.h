@@ -17,5 +17,5 @@ struct DatasetChoices
     mv::Dataset<> metadata;
 };
 
-bool chooseDatasets(const mv::Datasets& mainPointsCandidates, DatasetChoices& choices);
+bool chooseDatasets(const mv::Datasets& mainPointsCandidates, DatasetChoices& choices, QObject* setup);
 }

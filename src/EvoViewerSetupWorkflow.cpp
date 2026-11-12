@@ -90,6 +90,20 @@ WidgetAction* findUniqueActionByTitle(ViewPlugin* plugin, const QString& title)
     return match;
 }
 
+constexpr auto configuredViewsProperty = "EvoViewerSetupViewIds";
+
+ViewPlugin* findConfiguredView(const char* kind, const QStringList& configuredIds)
+{
+    auto* factory = configuredIds.isEmpty() ? nullptr : mv::plugins().getPluginFactory(QString::fromUtf8(kind));
+    if (!factory)
+        return nullptr;
+
+    for (auto* instance : mv::plugins().getPluginsByFactory(factory))
+        if (configuredIds.contains(instance->getId()))
+            return dynamic_cast<ViewPlugin*>(instance);
+    return nullptr;
+}
+
 ViewPlugin* findOrCreateView(const ViewRequest& request, QStringList& failures)
 {
     const QString kind = QString::fromUtf8(request.kind);
@@ -292,19 +306,27 @@ void hideSystemView(const QString& kind)
             view->getVisibleAction().setChecked(false);
 }
 
-void selectEvoViewerTutorial(ViewPlugin* tutorial, const std::function<void(bool)>& onFinished)
+void selectEvoViewerTutorial(QObject* context, ViewPlugin* tutorial, const std::function<void(bool)>& onFinished)
 {
     if (!tutorial) {
         onFinished(false);
         return;
     }
 
-    auto* retryTimer = new QTimer(tutorial);
+    auto* retryTimer = new QTimer(context);
     retryTimer->setInterval(100);
-    QObject::connect(retryTimer, &QTimer::timeout, tutorial,
-        [tutorial, retryTimer, attempts = 0, onFinished]() mutable {
+    QObject::connect(retryTimer, &QTimer::timeout, context,
+        [tutorial = QPointer<ViewPlugin>(tutorial), retryTimer = QPointer<QTimer>(retryTimer),
+         attempts = 0, onFinished]() mutable {
+        if (!tutorial) {
+            retryTimer->stop();
+            retryTimer->deleteLater();
+            onFinished(false);
+            return;
+        }
         ++attempts;
-        auto* tutorialPicker = dynamic_cast<OptionAction*>(tutorial->findChildByPath(QStringLiteral("Pick tutorial")));
+        QPointer<OptionAction> tutorialPicker = dynamic_cast<OptionAction*>(
+            tutorial->findChildByPath(QStringLiteral("Pick tutorial")));
         if (!tutorialPicker)
             tutorialPicker = findActionByPaths<OptionAction>(tutorial, { QStringLiteral("Pick tutorial") });
 
@@ -314,6 +336,8 @@ void selectEvoViewerTutorial(ViewPlugin* tutorial, const std::function<void(bool
             tutorialPicker->setCurrentText(QStringLiteral("Cytosplore EvoViewer"));
         }
 
+        if (!retryTimer)
+            return;
         if (tutorialPicker && tutorialPicker->getCurrentText() == QStringLiteral("Cytosplore EvoViewer")) {
             retryTimer->stop();
             retryTimer->deleteLater();
@@ -328,15 +352,40 @@ void selectEvoViewerTutorial(ViewPlugin* tutorial, const std::function<void(bool
 }
 }
 
+EvoViewerSetupPlugin::~EvoViewerSetupPlugin()
+{
+    finishStudioMode();
+}
+
+void EvoViewerSetupPlugin::finishStudioMode()
+{
+    const auto project = _setupProject;
+    _setupProject.clear();
+    if (project && project == mv::projects().getCurrentProject() && !setProjectStudioMode(false))
+        qWarning() << "EvoViewer setup: could not disable Studio Mode.";
+}
+
 void EvoViewerSetupPlugin::setupWorkspace()
 {
     if (_setupStarted)
         return;
     _setupStarted = true;
 
-    if (!EvoViewerSetup::requiredPluginsAvailable() ||
+    // Completed views belong to the workspace and survive the setup panel.
+    const QPointer<Workspace> workspace(mv::workspaces().getCurrentWorkspace());
+    const auto configuredIds = workspace ? workspace->property(configuredViewsProperty).toStringList() : QStringList{};
+    QPointer<ViewPlugin> cluster = findConfiguredView("XSC Cluster Rank", configuredIds);
+    QPointer<ViewPlugin> scatter = findConfiguredView("Scatterplot View", configuredIds);
+    QPointer<ViewPlugin> legend = findConfiguredView("ChartLegend View", configuredIds);
+    QPointer<ViewPlugin> genes = findConfiguredView("XSCGeneDetect", configuredIds);
+    QPointer<ViewPlugin> tree = findConfiguredView("XSCPhyTVu", configuredIds);
+    const bool reconnecting = cluster && scatter && legend && genes && tree;
+
+    const QPointer<EvoViewerSetupPlugin> setup(this);
+
+    if (!reconnecting && (!EvoViewerSetup::requiredPluginsAvailable() ||
         !EvoViewerSetup::requiredTreeDatasetsAvailable() ||
-        EvoViewerSetup::eligibleMainPointDatasets().isEmpty()) {
+        EvoViewerSetup::eligibleMainPointDatasets().isEmpty())) {
         qWarning() << "EvoViewer setup: required plugins or datasets are missing.";
         getVisibleAction().setChecked(false);
         return;
@@ -344,39 +393,71 @@ void EvoViewerSetupPlugin::setupWorkspace()
 
     // Studio Mode permits setup to create and link views even when the project
     // has restricted editing. Setup always leaves it disabled when finished.
-    if (!setProjectStudioMode(true)) {
+    auto* project = mv::projects().getCurrentProject();
+    if (!reconnecting || (project && !project->getStudioModeAction().isChecked()))
+        _setupProject = project;
+    const bool studioModeEnabled = setProjectStudioMode(true);
+    if (!setup)
+        return;
+    if (!studioModeEnabled) {
+        _setupProject.clear();
         qWarning() << "EvoViewer setup: could not enable Studio Mode.";
         getVisibleAction().setChecked(false);
         return;
     }
-    const auto disableStudioMode = []() {
-        if (!setProjectStudioMode(false))
-            qWarning() << "EvoViewer setup: could not disable Studio Mode.";
-    };
-    const auto fail = [this, disableStudioMode](const QString& reason) {
+    const auto fail = [setup](const QString& reason) {
         qWarning() << "EvoViewer setup:" << reason;
-        disableStudioMode();
-        getVisibleAction().setChecked(false);
+        if (setup)
+            setup->finishStudioMode();
+        if (setup)
+            setup->getVisibleAction().setChecked(false);
     };
 
     QStringList failures;
-    auto* cluster = findOrCreateView({ "XSC Cluster Rank", "Cluster Hierarchy View", nullptr, DockAreaFlag::Right }, failures);
-    auto* scatter = findOrCreateView({ "Scatterplot View", "Scatterplot Embedding View", cluster, DockAreaFlag::Bottom }, failures);
-    auto* legend = findOrCreateView({ "ChartLegend View", "Legend View", scatter, DockAreaFlag::Right }, failures);
-    auto* genes = findOrCreateView({ "XSCGeneDetect", "Gene Identification View", legend, DockAreaFlag::Right }, failures);
-    auto* tree = findOrCreateView({ "XSCPhyTVu", "Phylogenetic Tree View", genes, DockAreaFlag::Right }, failures);
+    if (!cluster)
+        cluster = findOrCreateView({ "XSC Cluster Rank", "Cluster Hierarchy View", nullptr, DockAreaFlag::Right }, failures);
+    if (!setup)
+        return;
+    if (!scatter)
+        scatter = findOrCreateView({ "Scatterplot View", "Scatterplot Embedding View", cluster, DockAreaFlag::Bottom }, failures);
+    if (!setup)
+        return;
+    if (!legend)
+        legend = findOrCreateView({ "ChartLegend View", "Legend View", scatter, DockAreaFlag::Right }, failures);
+    if (!setup)
+        return;
+    if (!genes)
+        genes = findOrCreateView({ "XSCGeneDetect", "Gene Identification View", legend, DockAreaFlag::Right }, failures);
+    if (!setup)
+        return;
+    if (!tree)
+        tree = findOrCreateView({ "XSCPhyTVu", "Phylogenetic Tree View", genes, DockAreaFlag::Right }, failures);
+    if (!setup)
+        return;
     QCoreApplication::processEvents();
+    if (!setup)
+        return;
 
     if (!failures.isEmpty() || !cluster || !scatter || !legend || !genes || !tree) {
         fail(QStringLiteral("required view unavailable"));
         return;
     }
 
+    const auto viewsStillAvailable = [&]() {
+        if (!setup)
+            return false;
+        if (cluster && scatter && legend && genes && tree &&
+            workspace == mv::workspaces().getCurrentWorkspace())
+            return true;
+        fail(QStringLiteral("workspace changed during setup"));
+        return false;
+    };
+
     // Use the exact instances just opened or reused above. Path-based action
     // lookup then stays bound to these views if the project has other copies.
-    auto* geneView = genes;
-    auto* phyView = tree;
-    auto* clusterView = cluster;
+    auto* geneView = genes.data();
+    auto* phyView = tree.data();
+    auto* clusterView = cluster.data();
 
     const std::array<std::pair<const char*, const char*>, 14> geneActionSpecs{{
         { "Reference Tree Dataset", "EvoViewer:GeneDetect:ReferenceTreeDataset" },
@@ -422,6 +503,8 @@ void EvoViewerSetupPlugin::setupWorkspace()
         failedPublications << QStringLiteral("Top Selected Hierarchy Status");
 
     QCoreApplication::processEvents();
+    if (!viewsStillAvailable())
+        return;
     if (!failedPublications.isEmpty()) {
         for (const auto& spec : geneActionSpecs) {
             const QString title = QString::fromUtf8(spec.first);
@@ -520,6 +603,8 @@ void EvoViewerSetupPlugin::setupWorkspace()
         // Give newly opened views and the action manager one event-loop turn,
         // then retry in case a view completed initialization during linking.
         QCoreApplication::processEvents();
+        if (!viewsStillAvailable())
+            return;
         requiredLinksReady = true;
         requiredLinksReady &= connectToPublishedAction(findActionByPaths(phyView, {
             QStringLiteral("XSCPhyTVuPlugin Chart/Chart Options/Reference tree")
@@ -553,10 +638,40 @@ void EvoViewerSetupPlugin::setupWorkspace()
         return;
     }
 
+    auto* scatterColor = findActionByPaths<DatasetPickerAction>(scatter, {
+        QStringLiteral("Settings/Datasets/Color")
+    });
+    auto* scatterSelectionColor = findActionByPaths<ColorAction>(scatter, {
+        QStringLiteral("Settings/Selection/Point Selection/Color")
+    });
+    auto* legendClusters = findActionByPaths<DatasetPickerAction>(legend, {
+        QStringLiteral("ChartLegendViewPlugin Chart/Color Options/Cluster dataset")
+    });
+    auto* legendSelectionColor = findActionByPaths<ColorAction>(legend, {
+        QStringLiteral("ChartLegendViewPlugin Chart/Color Options/Selection color")
+    });
+    if (reconnecting) {
+        const bool colorLinked = scatterColor && legendClusters &&
+            publishAction(scatterColor, QStringLiteral("EvoViewer:Scatterplot:ColorDataset")) &&
+            connectToPublishedAction(legendClusters, scatterColor);
+        const bool selectionColorLinked = scatterSelectionColor && legendSelectionColor &&
+            publishAction(scatterSelectionColor, QStringLiteral("EvoViewer:Scatterplot:SelectionColor")) &&
+            connectToPublishedAction(legendSelectionColor, scatterSelectionColor);
+        if (colorLinked && selectionColorLinked)
+            finishStudioMode();
+        else
+            fail(QStringLiteral("could not restore all Scatterplot and Legend View connections"));
+        return;
+    }
+
     // Resolve all links before asking for project-specific data. The tree and
     // metadata datasets must already exist; this setup never invokes a loader.
     EvoViewerSetup::DatasetChoices choices;
-    if (!EvoViewerSetup::chooseDatasets(EvoViewerSetup::eligibleMainPointDatasets(), choices)) {
+    const bool datasetsSelected = EvoViewerSetup::chooseDatasets(
+        EvoViewerSetup::eligibleMainPointDatasets(), choices, this);
+    if (!viewsStillAvailable())
+        return;
+    if (!datasetsSelected) {
         fail(QStringLiteral("dataset selection unavailable or cancelled"));
         return;
     }
@@ -573,21 +688,9 @@ void EvoViewerSetupPlugin::setupWorkspace()
     auto* scatterPosition = findActionByPaths<DatasetPickerAction>(scatter, {
         QStringLiteral("Settings/Datasets/Position")
     });
-    auto* scatterColor = findActionByPaths<DatasetPickerAction>(scatter, {
-        QStringLiteral("Settings/Datasets/Color")
-    });
     auto* scatterPointSize = findActionByPaths<DecimalAction>(scatter, {
         QStringLiteral("Settings/Plot/Point/Point size/Point size"),
         QStringLiteral("Settings/Plot/Point size/Point size")
-    });
-    auto* scatterSelectionColor = findActionByPaths<ColorAction>(scatter, {
-        QStringLiteral("Settings/Selection/Point Selection/Color")
-    });
-    auto* legendClusters = findActionByPaths<DatasetPickerAction>(legend, {
-        QStringLiteral("ChartLegendViewPlugin Chart/Color Options/Cluster dataset")
-    });
-    auto* legendSelectionColor = findActionByPaths<ColorAction>(legend, {
-        QStringLiteral("ChartLegendViewPlugin Chart/Color Options/Selection color")
     });
     auto* legendTitle = findActionByPaths<StringAction>(legend, {
         QStringLiteral("ChartLegendViewPlugin Chart/Color Options/Chart Title")
@@ -609,8 +712,12 @@ void EvoViewerSetupPlugin::setupWorkspace()
     // selected tree again can otherwise skip that callback and leave the chart empty.
     phyReferenceTree->setCurrentIndex(-1);
     QCoreApplication::processEvents();
+    if (!viewsStillAvailable())
+        return;
     datasetsApplied &= setDataset(phyReferenceTree, choices.referenceTree);
     QCoreApplication::processEvents();
+    if (!viewsStillAvailable())
+        return;
 
     datasetsApplied &= setDataset(dynamic_cast<DatasetPickerAction*>(geneActions.value(QStringLiteral("Reference Tree Dataset"))), choices.referenceTree);
     datasetsApplied &= setDataset(dynamic_cast<DatasetPickerAction*>(geneActions.value(QStringLiteral("Embedding Dataset"))), choices.embedding);
@@ -625,6 +732,8 @@ void EvoViewerSetupPlugin::setupWorkspace()
     // the metadata model and associates it with the selected reference tree.
     phyTraitDataset->setCurrentIndex(-1);
     QCoreApplication::processEvents();
+    if (!viewsStillAvailable())
+        return;
     datasetsApplied &= setDataset(phyTraitDataset, choices.metadata);
 
     // Match the scatterplot and legend datasets to the selections the user just made.
@@ -639,6 +748,8 @@ void EvoViewerSetupPlugin::setupWorkspace()
     }
 
     QCoreApplication::processEvents();
+    if (!viewsStillAvailable())
+        return;
     if (!QMetaObject::invokeMethod(tree, "triggerChartJS", Qt::DirectConnection)) {
         fail(QStringLiteral("Phylogenetic Tree refresh could not be triggered"));
         return;
@@ -702,17 +813,38 @@ void EvoViewerSetupPlugin::setupWorkspace()
     hideSystemView(QStringLiteral("Data properties"));
     hideSystemView(QStringLiteral("Data hierarchy"));
 
+    if (!viewsStillAvailable())
+        return;
+    if (workspace)
+        workspace->setProperty(configuredViewsProperty, QStringList{
+            cluster->getId(), scatter->getId(), legend->getId(), genes->getId(), tree->getId()
+        });
+    if (!setup)
+        return;
+
     // Open the tutorial after the linked views are ready.
-    QTimer::singleShot(250, this, [this, cluster, scatter, legend, genes, tree, scatterColor,
-                                   legendClusters, disableStudioMode]() {
+    QTimer::singleShot(250, this, [setup, workspace, cluster, scatter, legend, genes, tree,
+                                   scatterColor = QPointer<DatasetPickerAction>(scatterColor),
+                                   legendClusters = QPointer<DatasetPickerAction>(legendClusters), fail]() {
+        if (workspace != mv::workspaces().getCurrentWorkspace() || !cluster || !scatter || !legend || !genes || !tree) {
+            fail(QStringLiteral("workspace changed before opening the tutorial"));
+            return;
+        }
         QStringList ignoredFailures;
-        auto* tutorial = findOrCreateView({ "Tutorial", "", nullptr, DockAreaFlag::Right }, ignoredFailures);
+        const QPointer<ViewPlugin> tutorial = findOrCreateView({ "Tutorial", "", nullptr, DockAreaFlag::Right }, ignoredFailures);
 
         hideSystemView(QStringLiteral("Data properties"));
         hideSystemView(QStringLiteral("Data hierarchy"));
-        selectEvoViewerTutorial(tutorial, [setup = QPointer<EvoViewerSetupPlugin>(this), tutorial, scatter, scatterColor, legendClusters,
-                                           cluster, legend, genes, tree,
-                                           disableStudioMode](bool tutorialSelected) {
+        if (!setup)
+            return;
+        selectEvoViewerTutorial(setup, tutorial, [setup, workspace, tutorial, scatter, scatterColor, legendClusters,
+                                           cluster, legend, genes, tree, fail](bool tutorialSelected) {
+            if (!setup)
+                return;
+            if (workspace != mv::workspaces().getCurrentWorkspace() || !cluster || !scatter || !legend || !genes || !tree) {
+                fail(QStringLiteral("workspace changed before finalizing setup"));
+                return;
+            }
             if (!tutorialSelected)
                 qWarning() << "EvoViewer setup: tutorial view opened, but its requested tutorial was unavailable.";
             if (tutorial)
@@ -742,25 +874,25 @@ void EvoViewerSetupPlugin::setupWorkspace()
             hideSystemView(QStringLiteral("Data hierarchy"));
             if (setup)
                 setup->getVisibleAction().setChecked(false);
-            disableStudioMode();
-            if (auto* workspace = mv::workspaces().getCurrentWorkspace()) {
+            if (!setup)
+                return;
+            setup->finishStudioMode();
+            if (workspace && workspace == mv::workspaces().getCurrentWorkspace()) {
                 workspace->getLockingAction().getLockedAction().setChecked(true);
-                if (!workspace->getLockingAction().getLockedAction().isChecked())
+                if (workspace && !workspace->getLockingAction().getLockedAction().isChecked())
                     qWarning() << "EvoViewer setup: workspace layout could not be locked.";
             }
             if (tutorial) {
                 auto allowTutorialClose = [tutorial]() { tutorial->getMayCloseAction().setChecked(true); };
-                connect(&tutorial->getLockingAction().getLockedAction(), &ToggleAction::toggled,
+                QObject::connect(&tutorial->getLockingAction().getLockedAction(), &ToggleAction::toggled,
                         tutorial, allowTutorialClose);
                 allowTutorialClose();
             }
             if (!setup)
                 return;
-            QTimer::singleShot(0, setup, [cluster = QPointer<ViewPlugin>(cluster),
-                scatter = QPointer<ViewPlugin>(scatter), legend = QPointer<ViewPlugin>(legend),
-                genes = QPointer<ViewPlugin>(genes), tree = QPointer<ViewPlugin>(tree),
-                tutorial = QPointer<ViewPlugin>(tutorial)]() {
-                applyEvoViewerSplitSizes(mv::workspaces().getWidget(), cluster, scatter, legend, genes, tree, tutorial);
+            QTimer::singleShot(0, setup, [workspace, cluster, scatter, legend, genes, tree, tutorial]() {
+                if (workspace && workspace == mv::workspaces().getCurrentWorkspace())
+                    applyEvoViewerSplitSizes(mv::workspaces().getWidget(), cluster, scatter, legend, genes, tree, tutorial);
             });
         });
     });
