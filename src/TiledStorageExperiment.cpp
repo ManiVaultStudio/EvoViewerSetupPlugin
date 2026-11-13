@@ -141,6 +141,7 @@ public:
         _status->setWordWrap(true);
         controls->addWidget(_status);
         _progress = new QProgressBar(group);
+        _progress->setFormat(tr("%p% of current step"));
         controls->addWidget(_progress);
         _log = new QPlainTextEdit(group);
         _log->setReadOnly(true);
@@ -732,7 +733,7 @@ private:
                 if (fraction < 1.0f && elapsed - lastRefresh < 1000)
                     return;
                 lastRefresh = elapsed;
-                _progress->setValue(qRound(fraction * 100));
+                _progress->setValue(std::max(_progress->value(), std::clamp(static_cast<int>(fraction * 100), 0, 99)));
                 _status->setText(tr("Trial %1 · %2 · %3 s").arg(_trial)
                     .arg(fraction >= 1.0f ? tr("Finalizing tiled storage") : tr("Rebuilding tiled storage"))
                     .arg(elapsed / 1000));
@@ -895,7 +896,7 @@ private:
                 .arg(elapsed / 1000));
             if (_updateTask) {
                 _progress->setRange(0, 100);
-                _progress->setValue(qRound(100 * _updateTask->getProgress()));
+                _progress->setValue(std::clamp(static_cast<int>(100 * _updateTask->getProgress()), 0, 99));
             }
             return;
         }
@@ -1053,7 +1054,7 @@ private:
             _status->setText(tr("Trial %1 · %2 · %3 s").arg(_trial).arg(name).arg(_operation.elapsed() / 1000));
             if (_analysisTask) {
                 _progress->setRange(0, 100);
-                _progress->setValue(qRound(100 * _analysisTask->getProgress()));
+                _progress->setValue(std::clamp(static_cast<int>(100 * _analysisTask->getProgress()), 0, 99));
             }
             return;
         }
@@ -1122,7 +1123,7 @@ private:
             beginStage(tr("restoring original tiled storage settings"));
             _status->setText(tr("Restoring the original tiled storage settings…"));
             _status->repaint();
-            _progress->setRange(0, 100);
+            _progress->setRange(0, 0);
             try {
                 if (matchesInstalledLayout(_initial)) {
                     _points->configureStorageBackend(std::make_shared<StorageBackendConfiguration>(_initial));
@@ -1166,8 +1167,8 @@ private:
         _installed.reset();
         _originalStorage.reset();
         _active = _paused = _stopped = false;
-        _progress->setRange(0, 1);
-        _progress->setValue(1);
+        _progress->setRange(0, 100);
+        _progress->reset();
         _status->setText(tr("%1 · %2 completed trials · %3 s elapsed").arg(message).arg(_completedTrials).arg(_total.elapsed() / 1000));
         updateControls();
         trace(_status->text());

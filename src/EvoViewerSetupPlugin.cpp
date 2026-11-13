@@ -70,7 +70,7 @@ void EvoViewerSetupPlugin::init()
 
 EvoViewerSetupPluginFactory::EvoViewerSetupPluginFactory()
 {
-    setIconByName("compass");
+    setIconByName("sliders");
     getPluginMetadata().setDescription("Set up EvoViewer views and their linked controls.");
     getPluginMetadata().setSummary("Opens the EvoViewer views and configures their shared datasets.");
     setAllowPluginCreationFromStandardGui(false);

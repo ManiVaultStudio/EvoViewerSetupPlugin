@@ -156,7 +156,7 @@ class TrialResults final : public QDialog
 public:
     explicit TrialResults(QWidget* parent) : QDialog(parent)
     {
-        setWindowTitle(tr("Tiled storage experiment results"));
+        setWindowTitle(tr("Tile benchmark results"));
         resize(1000, 580);
         auto* layout = new QVBoxLayout(this);
         _summary = new QLabel(this);

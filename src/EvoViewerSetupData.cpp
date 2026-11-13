@@ -77,7 +77,7 @@ bool chooseDatasets(const Datasets& mainPointsCandidates, DatasetChoices& choice
     metadata.setCurrentDataset(allMetadata.first());
 
     auto* layout = new QVBoxLayout(&dialog);
-    layout->addWidget(new QLabel(QStringLiteral("Choose the datasets used by EvoViewer."), &dialog));
+    layout->addWidget(new QLabel(QStringLiteral("Choose datasets for the linked views."), &dialog));
 
     const auto addPicker = [layout, &dialog](DatasetPickerAction& picker) {
         auto* row = new QHBoxLayout();
