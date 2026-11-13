@@ -1,3 +1,5 @@
+#include <QStyle>
+#include "QtTooltipKit.h"
 #include "EvoViewerSetupPlugin.h"
 #include "TiledStorageTrialResults.h"
 
@@ -101,7 +103,11 @@ public:
         _budget = new QSpinBox(group);
         _budget->setRange(1, 800);
         _budget->setValue(15);
-        _budget->setToolTip(tr("The search can finish early when improvements level off. An operation already in progress runs to completion."));
+        qttooltipkit::set(*_budget, tr("Experiment time limit"), tr("Set how long the experiment can spend rebuilding layouts and measuring selected workloads."),
+            qttooltipkit::Options{
+                320, 10, std::numeric_limits<int>::max(), {{tr("What gets compared"), {tr("Each trial reports layout rebuild time separately from analysis time.")}}},
+                {}, tr("An analysis already in progress runs to completion.")
+            });
         budget->addWidget(_budget);
         budget->addStretch();
         controls->addLayout(budget);
@@ -121,6 +127,12 @@ public:
         _start = new QPushButton(tr("Start"), group);
         _pause = new QPushButton(tr("Pause"), group);
         _stop = new QPushButton(tr("Stop"), group);
+        _start->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+        _pause->setIcon(style()->standardIcon(QStyle::SP_MediaPause));
+        _stop->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+        qttooltipkit::set(*_start, tr("Start benchmark"), tr("Compare tile layouts using the selected cells and workloads."));
+        qttooltipkit::set(*_pause, tr("Pause benchmark"), tr("Pause scheduling between benchmark steps."));
+        qttooltipkit::set(*_stop, tr("Stop benchmark"), tr("End the experiment and keep completed results."));
         for (auto* button : {_start, _pause, _stop})
             buttons->addWidget(button);
         controls->addLayout(buttons);

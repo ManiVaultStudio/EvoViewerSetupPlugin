@@ -19,6 +19,21 @@ set(PLUGIN_SOURCES
 )
 
 add_library(${PROJECT_NAME} SHARED ${PLUGIN_SOURCES})
+
+if(NOT TARGET QtTooltipKit::Tooltips)
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../qt-tooltip-kit/CMakeLists.txt")
+        add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../qt-tooltip-kit" "${CMAKE_BINARY_DIR}/qt-tooltip-kit")
+    else()
+        set(QT_TOOLTIP_KIT_REPOSITORY "https://github.com/sbvis/qt-tooltip-kit.git" CACHE STRING "Qt Tooltip Kit repository")
+        set(QT_TOOLTIP_KIT_REVISION "4940bfd0a17358a2b7e17e12d41688c22b9a9615" CACHE STRING "Qt Tooltip Kit commit")
+        include(FetchContent)
+        FetchContent_Declare(QtTooltipKit
+            GIT_REPOSITORY "${QT_TOOLTIP_KIT_REPOSITORY}"
+            GIT_TAG "${QT_TOOLTIP_KIT_REVISION}")
+        FetchContent_MakeAvailable(QtTooltipKit)
+    endif()
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE QtTooltipKit::Tooltips)
 target_include_directories(${PROJECT_NAME} PRIVATE "${ManiVault_INCLUDE_DIR}")
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets Qt6::Network Qt6::WebEngineWidgets ManiVault::Core ManiVault::PointData ManiVault::ClusterData)
