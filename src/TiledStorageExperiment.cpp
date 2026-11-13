@@ -381,7 +381,7 @@ private:
             output.cancelWriting();
         }
         _points = _picker->getCurrentDataset<Points>();
-        if (!_points.isValid() || !_points->isFull() || _points->isProxy() || _points->isLocked() || !backend()) {
+        if (!_points.isValid() || !_points->isFull() || _points->isLocked() || !backend()) {
             rejectStart(tr("Choose a full, unlocked main dataset with tiled storage."));
             return;
         }

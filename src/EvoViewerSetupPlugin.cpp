@@ -55,6 +55,14 @@ void EvoViewerSetupPlugin::init()
 {
     connect(mv::Application::core(), &mv::CoreInterface::aboutToBeDestroyed,
         this, &EvoViewerSetupPlugin::finishStudioMode);
+    if (mv::projects().isOpeningProject()) {
+        // Older workspaces may contain the setup panel. Its configured views
+        // restore independently, so do not run setup over their saved state.
+        connect(&mv::projects(), &mv::AbstractProjectManager::projectOpened, this,
+            [this]() { mv::plugins().destroyPlugin(this); },
+            Qt::ConnectionType(Qt::QueuedConnection | Qt::SingleShotConnection));
+        return;
+    }
     initializeExperiments();
     _setupStarted = false;
     QTimer::singleShot(0, this, &EvoViewerSetupPlugin::setupWorkspace);

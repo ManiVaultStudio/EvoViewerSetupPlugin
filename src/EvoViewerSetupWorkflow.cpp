@@ -167,19 +167,34 @@ bool publishAction(WidgetAction* action, const QString& publicName)
     action->setConnectionPermissionsToAll();
 
     if (!action->isPublished()) {
-        if (!action->publish(publicName)) {
-            // A previous attempt or another view may already own the preferred
-            // shared name. Retry with this action's stable ID so name-based
-            // linking remains unambiguous and setup stays repeatable.
-            const QString uniqueName = QStringLiteral("%1 [%2]").arg(publicName, action->getId());
-            if (!action->publish(uniqueName)) {
-                qWarning() << "EvoViewer setup: core rejected action publication:" << action->getLocation(true)
-                           << "as" << publicName << "and" << uniqueName;
-                return false;
+        const QString restoredName = QStringLiteral("%1 [%2]").arg(publicName, action->getId());
+        const QString uniqueName = QStringLiteral("%1 - %2").arg(publicName, action->getId());
+        // Workspace restore can leave the public endpoint registered before its
+        // private action is linked. Reuse the endpoint to preserve other links.
+        const auto publicActions = mv::actions().getPublicActions();
+        for (const auto& name : {restoredName, uniqueName, publicName}) {
+            WidgetAction* endpoint = nullptr;
+            for (auto* candidate : publicActions) {
+                if (candidate->text() != name)
+                    continue;
+                if (endpoint) {
+                    endpoint = nullptr;
+                    break;
+                }
+                endpoint = candidate;
+            }
+            if (endpoint && endpoint->getTypeString() == action->getTypeString() &&
+                (name != publicName || endpoint->getConnectedActions().isEmpty())) {
+                mv::actions().connectPrivateActionToPublicAction(action, endpoint, true);
+                break;
             }
         }
+        if (!action->isPublished() && !action->publish(publicName) && !action->publish(uniqueName)) {
+            qWarning() << "EvoViewer setup: core rejected action publication:" << action->getLocation(true)
+                       << "as" << publicName << "and" << uniqueName;
+            return false;
+        }
     }
-
     const bool published = action->isPublished() && action->getPublicAction();
     if (!published)
         qWarning() << "EvoViewer setup: action has no public endpoint:" << action->getLocation(true)
@@ -217,11 +232,11 @@ bool connectToPublishedAction(WidgetAction* privateAction, WidgetAction* sourceA
         return false;
     }
 
-    if (privateAction->isConnected()) {
-        if (privateAction->getPublicAction() == publicAction)
-            return true;
-        mv::actions().disconnectPrivateActionFromPublicAction(privateAction, false);
-    }
+    if (privateAction->getPublicAction() == publicAction)
+        return true;
+
+    if (!mv::actions().getPublicActions().contains(publicAction))
+        return false;
 
     if (privateAction->isConnectionPermissionFlagSet(WidgetAction::ConnectionPermissionFlag::ForceNone)) {
         qWarning() << "EvoViewer setup: connection is not permitted:"
@@ -229,26 +244,10 @@ bool connectToPublishedAction(WidgetAction* privateAction, WidgetAction* sourceA
         return false;
     }
 
-    // Resolve by the published name, as the existing plugin linker pattern
-    // does. connectToPublicActionByName is protected in this core version, so
-    // use the manager's public connector after resolving the unique endpoint.
     privateAction->setConnectionPermissionsToAll();
-    WidgetAction* namedPublicAction = nullptr;
-    for (auto* candidate : mv::actions().getPublicActions()) {
-        if (candidate->text() != publicAction->text())
-            continue;
-        if (namedPublicAction) {
-            qWarning() << "EvoViewer setup: published action name is ambiguous:" << publicAction->text();
-            return false;
-        }
-        namedPublicAction = candidate;
-    }
-    if (!namedPublicAction || namedPublicAction != publicAction) {
-        qWarning() << "EvoViewer setup: named public action was not found:" << publicAction->text();
-        return false;
-    }
-
-    mv::actions().connectPrivateActionToPublicAction(privateAction, namedPublicAction, false);
+    if (privateAction->isConnected())
+        mv::actions().disconnectPrivateActionFromPublicAction(privateAction, false);
+    mv::actions().connectPrivateActionToPublicAction(privateAction, publicAction, false);
     return privateAction->isConnected() && privateAction->getPublicAction() == publicAction;
 }
 
@@ -644,6 +643,7 @@ void EvoViewerSetupPlugin::setupWorkspace()
         QStringLiteral("Settings/Datasets/Color")
     });
     auto* scatterSelectionColor = findActionByPaths<ColorAction>(scatter, {
+        QStringLiteral("Settings/Selection/Point Selection/Overlay color"),
         QStringLiteral("Settings/Selection/Point Selection/Color")
     });
     auto* legendClusters = findActionByPaths<DatasetPickerAction>(legend, {
@@ -860,18 +860,21 @@ void EvoViewerSetupPlugin::setupWorkspace()
                 selectionType->setCurrentText(QStringLiteral("Lasso"));
             else
                 qWarning() << "EvoViewer setup: scatterplot Lasso selection action was not found after view setup.";
-            if (scatterColor && legendClusters && scatterColor->getPublicAction() &&
-                !connectToPublishedAction(legendClusters, scatterColor))
-                qWarning() << "EvoViewer setup: Legend View color-dataset connection failed after layout.";
+            if (!connectToPublishedAction(legendClusters, scatterColor)) {
+                fail(QStringLiteral("Legend View color-dataset connection failed after layout"));
+                return;
+            }
             auto* scatterColorAction = findActionByPaths<ColorAction>(scatter, {
+                QStringLiteral("Settings/Selection/Point Selection/Overlay color"),
                 QStringLiteral("Settings/Selection/Point Selection/Color")
             });
             auto* legendSelectionAction = findActionByPaths<ColorAction>(legend, {
                 QStringLiteral("ChartLegendViewPlugin Chart/Color Options/Selection color")
             });
-            if (scatterColorAction && legendSelectionAction &&
-                !connectToPublishedAction(legendSelectionAction, scatterColorAction))
-                qWarning() << "EvoViewer setup: selection-color connection failed after layout.";
+            if (!connectToPublishedAction(legendSelectionAction, scatterColorAction)) {
+                fail(QStringLiteral("selection-color connection failed after layout"));
+                return;
+            }
             hideSystemView(QStringLiteral("Data properties"));
             hideSystemView(QStringLiteral("Data hierarchy"));
             if (setup)
