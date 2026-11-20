@@ -256,7 +256,7 @@ public:
             if (trial[column] >= 0)
                 item->setData(Qt::DisplayRole, trial[column]);
             else
-                item->setText(QStringLiteral("—"));
+                item->setText(QStringLiteral("n/a"));
             item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
             _table->setItem(row, column, item);
         }
