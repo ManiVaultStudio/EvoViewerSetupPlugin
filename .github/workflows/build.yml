@@ -1,0 +1,111 @@
+name: EvoViewerSetupPlugin
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  prepare_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix_setup.outputs.matrix }}
+    steps:
+      - name: Get matrix from file
+        id: matrix_setup
+        uses: ManiVaultStudio/github-actions/matrix_setup@main
+
+  cross-platform-build:
+    name: Cross platform build
+    needs: prepare_matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout the source
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout the source - pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Select Xcode for Mac only
+        if: startsWith(runner.os, 'macOS')
+        run: |
+          sudo xcode-select -switch /Applications/Xcode_${{matrix.build-xcode-version}}.app
+
+      - name: Setup python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Start ssh key agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.RULESSUPPORT_DEPLOY_KEY }}
+
+      - name: Install SSH deploy key for rulessupport
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.RULESSUPPORT_DEPLOY_KEY }}
+          known_hosts: github.com AAAAB3NzaC1yc2EAAAABIwAAAQEAq2A7hRGmdnm9tUDbO9IDSwBK6TbQa+PXYPCPy6rbTrTtw7PHkccKrpp0yVhp5HdEIcKr6pLlVDBfOLX9QUsyCOV0wzfjIJNlGEYsdlLJizHhbn2mUjvSAHQqZETYP81eFzLQNnPHt4EVVUh7VfDESU84KezmD5QlWpXLmvU31/yMf+Se8xhHTvKSCZIFImWwoG6mbUoWf9nzpIoaSjB+weqqUUmpaaasXVal72J+UX2B+2RPW3RcT0eOzQgqlJL3RKrTJvdsjE3JEAvGq3lGHSZXy28G3skua2SmVi/w4yCE6gbODqnTWlg7+wC604ydGXA8VJiS5ap43JXiUFFAaQ==
+
+      - name: Windows build
+        if: startsWith(runner.os, 'Windows')
+        uses: ManiVaultStudio/github-actions/conan_windows_build@main
+        with:
+          conan-visual-version: ${{matrix.build-cversion}}
+          conan-visual-runtime: ${{matrix.build-runtime}}
+          conan-build-type: ${{matrix.build-config}}
+          conan-user: ${{secrets.LKEB_UPLOAD_USER}}
+          conan-password: ${{secrets.LKEB_UPLOAD_USER_PASSWORD}}
+          conan-pem: ${{secrets.LKEB_UPLOAD_CERT_CHAIN}}
+          rs_ssh_key: ${{ secrets.RULESSUPPORT_DEPLOY_KEY }}
+          sentry-upload: ${{ startsWith(github.ref, 'refs/heads/release/') }}
+          sentry-url: ${{secrets.LKEB_SENTRY_URL }}
+          sentry-org: ${{secrets.LKEB_SENTRY_ORG }}
+          sentry-project: ${{secrets.LKEB_SENTRY_PROJECT }}
+          sentry-auth-token: ${{secrets.LKEB_SENTRY_AUTH_TOKEN }}
+
+      - name: Linux build
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: ManiVaultStudio/github-actions/conan_linuxmac_build@main
+        with:
+          conan-compiler: ${{matrix.build-compiler}}
+          conan-compiler-version: ${{matrix.build-cversion}}
+          conan-libcxx-version: ${{matrix.build-libcxx}}
+          conan-build-type: ${{matrix.build-config}}
+          conan-build-os: ${{matrix.build-os}}
+          build-arch: ${{matrix.build-arch}}
+          conan-user: ${{secrets.LKEB_UPLOAD_USER}}
+          conan-password: ${{secrets.LKEB_UPLOAD_USER_PASSWORD}}
+          conan-pem: ${{secrets.LKEB_UPLOAD_CERT_CHAIN}}
+          conan-cc: gcc-${{matrix.build-cversion}}
+          conan-cxx: g++-${{matrix.build-cversion}}
+
+      - name: Mac build
+        if: startsWith(matrix.os, 'macos')
+        uses: ManiVaultStudio/github-actions/conan_linuxmac_build@main
+        with:
+          conan-compiler: ${{matrix.build-compiler}}
+          conan-compiler-version: ${{matrix.build-cversion}}
+          conan-libcxx-version: ${{matrix.build-libcxx}}
+          conan-build-type: ${{matrix.build-config}}
+          conan-build-os: ${{matrix.build-os}}
+          build-arch: ${{matrix.build-arch}}
+          conan-user: ${{secrets.LKEB_UPLOAD_USER}}
+          conan-password: ${{secrets.LKEB_UPLOAD_USER_PASSWORD}}
+          conan-pem: ${{secrets.LKEB_UPLOAD_CERT_CHAIN}}
