@@ -1,32 +1,41 @@
 from conans import ConanFile
-from conan.tools.cmake import CMake, CMakeToolchain
+from conan.tools.cmake import CMakeDeps, CMake, CMakeToolchain
 from conans.tools import save, load
 import os
 import pathlib
 import subprocess
 from rules_support import PluginBranchInfo
-
+from conans import tools
+import shutil
 
 class EvoViewerSetupPluginConan(ConanFile):
-    """Package EvoViewerSetupPlugin using Conan.
+    """Class to package using conan
 
+    Packages both RELEASE and RELWITHDEBINFO.
     Uses rules_support (github.com/ManiVaultStudio/rulessupport) to derive
-    version information from the branch naming convention.
+    versioninfo based on the branch naming convention
+    as described in https://github.com/ManiVaultStudio/core/wiki/Branch-naming-rules
     """
 
     name = "EvoViewerSetupPlugin"
     description = "Sets up a ManiVault workspace for the Cytosplore EvoViewer workflow."
     topics = ("manivault", "plugin", "setup", "EvoViewerSetupPlugin")
     url = "https://github.com/ManiVaultStudio/EvoViewerSetupPlugin"
-    author = "ManiVaultStudio"
+    author = "sbasu"  # conan recipe author
     license = "LGPL 3.0"
 
     short_paths = True
     generators = "CMakeDeps"
 
+    # Options may need to change depending on the packaged library
     settings = {"os": None, "build_type": None, "compiler": None, "arch": None}
     options = {"shared": [True, False], "fPIC": [True, False]}
     default_options = {"shared": True, "fPIC": True}
+
+    # Data plugin dependencies
+    #requires = ("XSCTreeData/bican_bg@lkeb/stable", "XSCTreeMetaData/bican_bg@lkeb/stable")
+
+    # Qt requirement is inherited from hdps-core
 
     scm = {
         "type": "git",
@@ -42,18 +51,11 @@ class EvoViewerSetupPluginConan(ConanFile):
         print(f"git info from {path}")
         return path
 
-    def export(self):
-        save(
-            pathlib.Path(self.export_folder, "__gitpath.txt"),
-            str(pathlib.Path(__file__).parent.resolve()),
-        )
-
-    def set_version(self):
-        branch_info = PluginBranchInfo(self.recipe_folder)
-        self.version = branch_info.version
-
     def _dependency_channel(self):
-        branch = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_REF_NAME")
+        branch = (
+            os.getenv("GITHUB_HEAD_REF")
+            or os.getenv("GITHUB_REF_NAME")
+        )
 
         if not branch:
             branch = subprocess.check_output(
@@ -69,25 +71,42 @@ class EvoViewerSetupPluginConan(ConanFile):
             ).strip()
 
         self.output.info(f"Detected branch: {branch}")
+
         if branch in ("main", "master", "HEAD"):
             return "latest"
 
         return branch.rsplit("/", 1)[-1]
 
+    def export(self):
+        print("In export")
+        # save the original source path to the directory used to build the package
+        save(
+            pathlib.Path(self.export_folder, "__gitpath.txt"),
+            str(pathlib.Path(__file__).parent.resolve()),
+        )
+
+    def set_version(self):
+        # Assign a version from the branch name
+        branch_info = PluginBranchInfo(self.recipe_folder)
+        self.version = branch_info.version
+        # print(f"Got version: {self.version}")
+
     def requirements(self):
         channel = self._dependency_channel()
+
         self.output.info(f"Using XSCTreeData channel: {channel}")
+
         self.requires(f"XSCTreeData/{channel}@lkeb/stable")
         self.requires(f"XSCTreeMetaData/{channel}@lkeb/stable")
 
         branch_info = PluginBranchInfo(self.__get_git_path())
-        self.output.info(f"Core requirement {branch_info.core_requirement}")
         self.requires(branch_info.core_requirement)
 
     def configure(self):
         pass
 
     def system_requirements(self):
+        #  May be needed for macOS or Linux
         pass
 
     def config_options(self):
@@ -102,15 +121,31 @@ class EvoViewerSetupPluginConan(ConanFile):
             generator = "Ninja Multi-Config"
 
         tc = CMakeToolchain(self, generator=generator)
+
         tc.variables["CMAKE_CXX_STANDARD_REQUIRED"] = "ON"
 
+        # Use the Qt provided .cmake files
         qt_path = pathlib.Path(self.deps_cpp_info["qt"].rootpath)
         qt_cfg = list(qt_path.glob("**/Qt6Config.cmake"))[0]
-        tc.variables["Qt6_DIR"] = qt_cfg.parents[0].as_posix()
+        qt_dir = qt_cfg.parents[0].as_posix()
 
+        tc.variables["Qt6_DIR"] = qt_dir
+
+        # Use the ManiVault .cmake file to find ManiVault with find_package
         mv_core_root = self.deps_cpp_info["hdps-core"].rootpath
         manivault_dir = pathlib.Path(mv_core_root, "cmake", "mv").as_posix()
+        print("ManiVault_DIR: ", manivault_dir)
         tc.variables["ManiVault_DIR"] = manivault_dir
+        
+        # Give the installation directory to CMake
+        MV_CSCTD_PATH = pathlib.Path(self.deps_cpp_info["XSCTreeData"].rootpath).as_posix()
+        tc.variables["MV_CSCTD_INSTALL_DIR"] = MV_CSCTD_PATH
+        MV_CSCTMD_PATH = pathlib.Path(self.deps_cpp_info["XSCTreeMetaData"].rootpath).as_posix()
+        tc.variables["MV_CSCTMD_INSTALL_DIR"] = MV_CSCTMD_PATH
+
+        # Set some build options
+        tc.variables["MV_UNITY_BUILD"] = "ON"
+
         tc.generate()
 
     def _configure_cmake(self):
@@ -121,12 +156,15 @@ class EvoViewerSetupPluginConan(ConanFile):
 
     def build(self):
         print("Build OS is: ", self.settings.os)
+
         cmake = self._configure_cmake()
         cmake.build(build_type="RelWithDebInfo")
 
     def package(self):
         package_dir = pathlib.Path(self.build_folder, "package")
-        rel_with_deb_info_dir = package_dir / "RelWithDebInfo"
+        relWithDebInfo_dir = package_dir / "RelWithDebInfo"
+        release_dir = package_dir / "Release"
+        print("Packaging install dir: ", package_dir)
         subprocess.run(
             [
                 "cmake",
@@ -135,9 +173,8 @@ class EvoViewerSetupPluginConan(ConanFile):
                 "--config",
                 "RelWithDebInfo",
                 "--prefix",
-                rel_with_deb_info_dir,
-            ],
-            check=True,
+                relWithDebInfo_dir,
+            ]
         )
         self.copy(pattern="*", src=package_dir)
 

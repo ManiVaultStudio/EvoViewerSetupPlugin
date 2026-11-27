@@ -6,21 +6,27 @@ on:
   workflow_dispatch:
 
 env:
+  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
 
+# for matrix check https://docs.github.com/en/actions/reference/specifications-for-github-hosted-runners
 jobs:
   prepare_matrix:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix_setup.outputs.matrix }}
     steps:
-      - name: Get matrix from file
-        id: matrix_setup
-        uses: ManiVaultStudio/github-actions/matrix_setup@main
-
+    - name: Get matrix from file
+      id: matrix_setup
+      uses: ManiVaultStudio/github-actions/matrix_setup@main
+      
   cross-platform-build:
     name: Cross platform build
     needs: prepare_matrix
+    # The CMake configure and build commands are platform agnostic and should work equally
+    # well on Windows or Mac.  You can convert this to a matrix build if you need
+    # cross-platform coverage.
+    # See: https://docs.github.com/en/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -28,18 +34,9 @@ jobs:
 
     steps:
       - name: Checkout the source
-        if: github.event_name != 'pull_request'
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
-
-      - name: Checkout the source - pull request
-        if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
           ref: ${{ github.event.pull_request.head.ref }}
 
       - name: Select Xcode for Mac only
@@ -95,7 +92,7 @@ jobs:
           conan-pem: ${{secrets.LKEB_UPLOAD_CERT_CHAIN}}
           conan-cc: gcc-${{matrix.build-cversion}}
           conan-cxx: g++-${{matrix.build-cversion}}
-
+  
       - name: Mac build
         if: startsWith(matrix.os, 'macos')
         uses: ManiVaultStudio/github-actions/conan_linuxmac_build@main
